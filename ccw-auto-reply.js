@@ -111,11 +111,17 @@ function saveState(state) {
 
 /* ---------------- AI ---------------- */
 
-/* 把对方评论内容交给 AI，返回一句回复；任何异常都返回空串，交给兜底文案 */
-async function aiReply(notice) {
-  if (!AI_API_URL || !AI_API_KEY) return '';
+/* 把对方评论内容交给 AI，返回一个决策对象：
+ *   { reply, pin, del, like_oid }
+ * 人设里已经规定了这套 JSON 契约。AI 不听话时（返回纯文本、带 ```json 包裹、
+ * 或者干脆是空），统一按「纯文本回复、不置顶、不删、不点赞」处理，不让流程崩。
+ */
+const EMPTY_DECISION = { reply: '', pin: false, del: false, like_oid: '' };
+
+async function aiDecision(notice) {
+  if (!AI_API_URL || !AI_API_KEY) return { ...EMPTY_DECISION };
   const incoming = String(notice.comment || '').slice(0, 500);
-  if (!incoming) return '';
+  if (!incoming) return { ...EMPTY_DECISION };
 
   const body = {
     model: AI_MODEL,
@@ -123,7 +129,8 @@ async function aiReply(notice) {
       { role: 'system', content: AI_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: `有人在我的${notice.subjectType === 'PROFILE' ? '主页留言板' : '作品评论区'}留言：「${incoming}」。\n请回一句。`
+        content: `有人在我的${notice.subjectType === 'PROFILE' ? '主页留言板' : '作品评论区'}留言：「${incoming}」。\n` +
+          '按人设回一句，并按要求输出那个 JSON。'
       }
     ],
     temperature: 1,        // kimi-k3 只接受 1，写 0.7 会直接 400 invalid temperature
@@ -155,25 +162,62 @@ async function aiReply(notice) {
           continue;
         }
         console.log('   AI 持续限流，放弃本条，改兜底文案');
-        return '';
+        return { ...EMPTY_DECISION };
       }
       if (!res.ok) {
         console.log('   AI 接口返回', res.status, (await res.text()).slice(0, 200));
-        return '';
+        return { ...EMPTY_DECISION };
       }
 
       const data = await res.json();
       const text = (data.choices && data.choices[0] && data.choices[0].message &&
         data.choices[0].message.content) || '';
-      const out = clean(text);
-      if (!out) console.log('   AI 返回空内容（多半是 max_tokens 不够），改用兜底文案');
+      const out = parseDecision(text);
+      if (!out.reply && !out.del) console.log('   AI 没给可用内容（多半是 max_tokens 不够），改用兜底文案');
       return out;
     } catch (e) {
       console.log('   AI 调用失败:', e.message);
-      return '';
+      return { ...EMPTY_DECISION };
     }
   }
-  return '';
+  return { ...EMPTY_DECISION };
+}
+
+/* 把 AI 的原始输出解析成决策对象。
+ * 已知的坑：kimi-k3 有时会用 ```json 包裹，有时前面加一句「好的，这是回复：」，
+ * 有时干脆不按契约、只回一句人话。这三种都兜住。 */
+function parseDecision(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return { ...EMPTY_DECISION };
+
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try {
+      const obj = JSON.parse(text.slice(start, end + 1));
+      const reply = clean(obj.reply || '');
+      const likeOid = String(obj.like_oid || obj.likeOid || '').trim();
+      return {
+        reply,
+        pin: obj.pin === true || obj.pin === 'true',
+        del: obj.delete === true || obj.delete === 'true',
+        like_oid: /^[0-9a-f]{24}$/i.test(likeOid) ? likeOid : ''
+      };
+    } catch (e) {
+      // 落到下面按纯文本处理
+    }
+  }
+  return { reply: clean(text), pin: false, del: false, like_oid: '' };
+}
+
+/* 从留言正文里刨作品 oid：支持 ccw.site 作品链接、/detail/<oid>、以及裸 oid。
+ * AI 漏填 like_oid 时用这个兜底——用户说「帮我给这个作品点赞」时正文里一定有链接。 */
+function oidFromText(s) {
+  const t = String(s || '');
+  const m = t.match(/(?:www\.)?ccw\.site\/(?:detail|works?|creation)\/([0-9a-f]{24})/i) ||
+    t.match(/\/detail\/([0-9a-f]{24})/i) ||
+    t.match(/\b([0-9a-f]{24})\b/i);
+  return m ? m[1] : '';
 }
 
 /* 评论框里放不下换行，压成单行并限长 */
@@ -220,12 +264,50 @@ async function oneCycle(client, state, opts) {
   for (const n of todo) {
     const who = n.senderName || n.senderOid || '?';
     const preview = String(n.comment || '').replace(/\s+/g, ' ').slice(0, 40);
-    const aiText = await aiReply(n);
-    const body = pickText(n, aiText);
+    const act = await aiDecision(n);
+    const body = pickText(n, act.reply);
+    // AI 漏填 like_oid 时，从正文里刨链接兜底：对方把作品链接贴过来求赞的情况很常见
+    const likeOid = act.like_oid || oidFromText(n.comment);
 
     if (dryRun) {
-      console.log(`   [dry-run] ${who}：「${preview}」-> 「${body}」`);
+      const tags = [];
+      if (act.del) tags.push('删评论');
+      if (act.pin) tags.push('置顶/点赞该评论');
+      if (likeOid) tags.push('给作品 ' + likeOid + ' 点赞');
+      console.log(`   [dry-run] ${who}：「${preview}」-> 「${body}」${tags.length ? ' [动作: ' + tags.join(' + ') + ']' : ''}`);
       continue;
+    }
+
+    /* 1) 辱骂/广告：直接删掉对方那条评论，不回复。
+     *    comment id 就是通知里的 triggeredById。删别人的评论需要作品作者身份，
+     *    失败也照实记录，不做重试。 */
+    if (act.del) {
+      const d = await client.del(n.triggeredById);
+      const ok = String(d && d.code) === '200';
+      console.log(`   删评论 ${n.triggeredById}（${who}）-> ${ok ? '成功' : JSON.stringify(d).slice(0, 160)}`);
+      state.replied[String(n.triggeredById)] = { at: now, deleted: Number(n.triggeredById), delOk: ok };
+      await sleep(rand(3000, 6000));
+      continue;
+    }
+
+    /* 2) 对方贴了作品链接求赞：先点作品赞，再回复（顺序按用户要求） */
+    if (likeOid) {
+      const r = await client.likeCreation(likeOid);
+      const ok = String(r && r.code) === '200';
+      console.log(`   作品点赞 ${likeOid} -> ${ok ? '成功' : JSON.stringify(r).slice(0, 160)}`);
+      await sleep(rand(2000, 4000));
+    }
+
+    /* 3) 对方夸我：给这条评论点赞，并尝试置顶。
+     *    置顶实测是官方权限（自己作品下也报「作品仅允许作者操作」），
+     *    所以置顶必然失败，只记一行日志，不当成错误，也不重试。 */
+    if (act.pin) {
+      const lr = await client.likeComment(n.triggeredById);
+      console.log(`   评论点赞 ${n.triggeredById} -> ${String(lr && lr.code) === '200' ? '成功' : JSON.stringify(lr).slice(0, 120)}`);
+      const pr = await client.pinComment(n.triggeredById);
+      const pinOk = String(pr && pr.code) === '200';
+      console.log(`   置顶尝试 ${n.triggeredById} -> ${pinOk ? '成功' : '被拒（' + String((pr && pr.msg) || '').slice(0, 40) + '）'}`);
+      await sleep(rand(2000, 4000));
     }
 
     const r = await client.replyToNotice(n, body);
@@ -240,7 +322,11 @@ async function oneCycle(client, state, opts) {
         state.replied[String(n.triggeredById)] = { at: now, nested: false, deleted: created };
         continue;
       }
-      state.replied[String(n.triggeredById)] = { at: now, id: created, parentId: parent };
+      state.replied[String(n.triggeredById)] = {
+        at: now, id: created, parentId: parent,
+        ...(likeOid ? { likedOid: likeOid } : {}),
+        ...(act.pin ? { pinned: true } : {})
+      };
       sent += 1;
       console.log(`   已回复 ${who} -> commentId ${created}${parent ? ' parentId=' + parent : ''}`);
     } else {
