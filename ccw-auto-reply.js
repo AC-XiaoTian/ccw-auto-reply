@@ -264,7 +264,8 @@ async function oneCycle(client, state, opts) {
     await client.init();
   } catch (e) {
     console.error('签名初始化失败:', e.message);
-    console.error('最常见原因：Cookie 里的 token 过期（有效期约 16 天）。' +
+    console.error('最常见原因：Cookie 里的 token 失效了（登录态过期）。' +
+      '前端写入这份 cookie 时给的是 180 天，但服务端真正认多久没有公开数据，可能远短于此。' +
       '注意这时接口可能返回「网络故障 0000003」，那不是网络问题，是缺登录态。');
     process.exit(1);
   }
@@ -348,7 +349,7 @@ async function oneCycle(client, state, opts) {
     }
 
     console.error('鉴权失败：' + fatal);
-    console.error('这是 Cookie 失效（token 有效期约 16 天）。重新从浏览器复制 Cookie，更新 CCW_COOKIE。');
+    console.error('这是 Cookie 失效（登录态过期）。重新从浏览器复制 Cookie，更新 CCW_COOKIE。');
     process.exit(1);
   }
 })().catch((e) => {
