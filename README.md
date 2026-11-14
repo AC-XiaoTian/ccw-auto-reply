@@ -30,16 +30,18 @@ Request Headers 里找到 `Cookie:` 整行复制。token 是 40 字符，cookie-
 
 ### 2. 加 Variables（可选，同一页面 Variables 标签）
 
-| Name | 示例 |
+代码里已经写好了默认值（Moonshot / kimi-k3），**这一栏不填也能跑**，只有想换才填：
+
+| Name | 默认（代码内置） |
 |---|---|
-| `AI_API_URL` | `https://api.deepseek.com/v1/chat/completions` |
-| `AI_MODEL` | `deepseek-chat` / `gpt-4o-mini` |
-| `AI_SYSTEM_PROMPT` | 自定义回复风格，不填用内置的 |
+| `AI_API_URL` | `https://api.moonshot.cn/v1/chat/completions` |
+| `AI_MODEL` | `kimi-k3` |
+| `AI_SYSTEM_PROMPT` | 内置人设（见下），填了就整段替换 |
 
 然后去 Actions → CCW 自动回复 → Run workflow，先保持 `dry_run` 勾选看它打算回什么，
 确认后再取消勾选跑一次真发。
 
-## 频率：为什么不是“每 3 分钟跑一次任务”
+## 频率：为什么不是"每 3 分钟跑一次任务"
 
 GitHub 的 `schedule` 最小粒度是 5 分钟，写 `*/3` 无效，这是平台硬限制。
 本项目的做法是 **5 分钟触发 + 单次运行内轮询 2 轮、间隔 150 秒**，
@@ -49,6 +51,26 @@ GitHub 的 `schedule` 最小粒度是 5 分钟，写 `*/3` 无效，这是平台
 
 - GitHub 的 cron 有 **5~30 分钟漂移**，整点前后最严重，会丢触发。
 - 想真正到 1 分钟级，只能换 Cloudflare Workers 或国内云函数，GitHub Actions 到不了。
+
+## AI 这一环（2026-11-15 实测）
+
+用的是 Moonshot 的 key，`GET /v1/models` 只返回 `kimi-k3` 和 `kimi-k3.1-pro`。实测踩到三个坑，代码里都已经处理：
+
+| 坑 | 现象 | 处理 |
+|---|---|---|
+| `temperature` 只认 1 | 传 0.7 直接 `400 invalid temperature` | 固定 `temperature: 1` |
+| 推理 token 占预算 | `max_tokens: 120` / `800` 都返回**空 content**，`finish_reason` 却是别的 | 设 `max_tokens: 2000`，空 content 时打日志并退兜底文案 |
+| 组织限流 3 次/分钟 | 连发 4 条就 `429 ... max RPM: 3` | 间隔 8~14 秒，429 等 3 秒重试一次，仍失败就退兜底 |
+
+一条真实回复的用量：`prompt_tokens 327 + completion_tokens 498`（其中 `reasoning_tokens` 469），
+单次调用约 12~16 秒。所以单次运行上限设 3 条，别开大。
+
+内置人设要点（在 `ccw-auto-reply.js` 的 `AI_SYSTEM_PROMPT` 里，改一处即换风格）：
+干脆、有点皮但不油的技术宅口吻；一句话 20~30 字；不自称 AI；
+**不编造关卡/道具/机制细节**；不承诺更新时间、不发链接、不留联系方式；不复读原话、不引导加好友。
+
+实测输出样例：评论「这游戏好难，第三关过不去」→
+「第三关是有点卡人，我自己也卡过几回，多试几次找找手感。」
 
 ## 两个硬限制（实测，不是推测）
 
@@ -80,9 +102,9 @@ GitHub 的 `schedule` 最小粒度是 5 分钟，写 `*/3` 无效，这是平台
 
 ```powershell
 $env:CCW_COOKIE='token=...; cookie-user-id=...'
-$env:AI_API_URL='https://api.deepseek.com/v1/chat/completions'
+$env:AI_API_URL='https://api.moonshot.cn/v1/chat/completions'
 $env:AI_API_KEY='sk-...'
-$env:AI_MODEL='deepseek-chat'
+$env:AI_MODEL='kimi-k3'
 node ccw-auto-reply.js     # 默认 dry-run，只打印
 ```
 
@@ -94,7 +116,7 @@ node ccw-auto-reply.js     # 默认 dry-run，只打印
 |---|---|---|
 | `CCW_COOKIE` | — | 必填 |
 | `CCW_AUTO_REPLY` | 未设 | `1` 才真发 |
-| `AI_API_URL` / `AI_API_KEY` / `AI_MODEL` | — | 不配则用兜底文案 |
+| `AI_API_URL` / `AI_API_KEY` / `AI_MODEL` | Moonshot / kimi-k3 | 不配 key 则用兜底文案 |
 | `CCW_REPLY_TEXT` | — | 固定文案兜底 |
 | `CCW_MAX_AGE_HOURS` | 24 | 只回这么多小时内的通知 |
 | `CCW_MAX_PER_RUN` | 3 | 单次最多回几条 |
