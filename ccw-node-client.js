@@ -133,6 +133,40 @@ class CCWClient {
     return this._signed('/study-community/comment/delete', { id: Number(commentId) });
   }
 
+  /* ---------- 点赞 / 置顶（2026-11-15 实测口径） ---------- */
+
+  /* 给作品点赞。字段是 oid + action，缺一个都不行：
+   *   {oid}            -> oid不能为空
+   *   {creationOid}    -> action不能为空
+   *   {oid, action}    -> 成功，返回 {body: 点赞数, code:"200"}
+   * action 只认 "LIKE"（"ADD"/"CANCEL"/"UNLIKE" 都报 action不能为空）。
+   * oid 必须是作品本体 oid（列表里的 oid），传 creationRelease.oid 会报「创意作品不存在」。 */
+  async likeCreation(oid) {
+    if (!/^[0-9a-f]{24}$/i.test(String(oid || ''))) {
+      return { code: '0000001', msg: '本地校验失败：oid 不是 24 位十六进制' };
+    }
+    return this._signed('/creation_stats/like', { oid: String(oid), action: 'LIKE' });
+  }
+
+  /* 给评论点赞。字段是 commentId（传 id 会报「评论ID不能为空」） */
+  async likeComment(commentId) {
+    return this._signed('/comment/like_record/create', { commentId: Number(commentId) });
+  }
+
+  /* 取消评论点赞 */
+  async unlikeComment(commentId) {
+    return this._signed('/comment/like_record/delete', { commentId: Number(commentId) });
+  }
+
+  /* 尝试把评论置顶。
+   * 实测（2026-11-15）：即使评论就在自己作品下、且是官方精选里那条，
+   * 也一律返回「作品仅允许作者操作(4001073X01)」，allow_update_weight 恒为 false。
+   * 说明 CCW 的评论置顶/精选是官方权限。保留这个方法只为以后放开时能直接用，
+   * 现在调用必然失败，调用方要按「失败即跳过」处理，不要重试。 */
+  async pinComment(commentId) {
+    return this._signed('/study-community/comment/top', { id: Number(commentId) });
+  }
+
   /* 直接吃一条通知条目并回复它 */
   async replyToNotice(notice, content) {
     if (!notice) throw new Error('notice 为空');
