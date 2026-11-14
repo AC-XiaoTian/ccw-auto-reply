@@ -1,15 +1,14 @@
 name: CCW 自动回复
 
-# ─── 节奏（2026-11-15 调整）───
-# GitHub 的 schedule 最小粒度是 5 分钟。原先是每 5 分钟 × 单次 2 轮 × 每轮 3 条，
-# 理论上限 72 条/小时（1728 条/天），在 CCW 上等于刷屏。
-# 现在：每 30 分钟触发一次、单次 1 轮、每轮最多 2 条 → 上限 4 条/小时（96 条/天），
-# 且受 AI 的 3 次/分钟限制约束，实际远低于此。
+# ─── 节奏（2026-11-15 最终版）───
+# 每 5 分钟检测一次（GitHub 的 schedule 最小粒度就是 5 分钟）。
+# 检测频率 ≠ 发送量：每轮最多回 2 条，没有新留言就什么都不发。
+# 发送量只取决于新留言多少，不会因为查得勤就刷屏。
 
 on:
   schedule:
-    # 每 30 分钟，偏移 2 分起跳，避开整点拥堵
-    - cron: "2,32 * * * *"
+    # 每 5 分钟，偏移 2 分起跳，避开整点拥堵
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -82,7 +81,8 @@ jobs:
 
       - name: 保存去重状态
         # always()：鉴权失败时也要把 authFailAt 存下来，否则限流计数永远不生效
-        if: always() && github.event_name == 'schedule' && steps.guard.outputs.ready == 'true'
+        # 手动跑真实发送（dry_run=false）也提交，这样首跑的「认领」能立刻落盘
+        if: always() && steps.guard.outputs.ready == 'true' && (github.event_name == 'schedule' || github.event.inputs.dry_run == 'false')
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
