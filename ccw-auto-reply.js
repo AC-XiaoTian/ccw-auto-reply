@@ -58,9 +58,23 @@ const AI_SYSTEM_PROMPT = (process.env.AI_SYSTEM_PROMPT || '').trim() || [
 ].join('\n');
 
 const FALLBACK_TEXT = process.env.CCW_REPLY_TEXT || '';
+/* 首次运行只做「认领」不发送：把当前窗口内的通知全部标记成已处理，避免把你手回过的再回一遍 */
+const BOOTSTRAP = process.env.CCW_BOOTSTRAP === '1';
+/* 两次 AI 调用之间的最小间隔。这把 key 的组织上限是 3 次/分钟，21 秒最稳 */
+const AI_MIN_INTERVAL_MS = Number(process.env.AI_MIN_INTERVAL_MS || '21000');
+/* 鉴权失败（Cookie 失效）时，多少小时内不再让 run 变红，避免每轮刷失败邮件 */
+const AUTH_FAIL_THROTTLE_HOURS = Number(process.env.CCW_AUTH_FAIL_THROTTLE_HOURS || '24');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+/* AI 调用节流：保证任意两次调用间隔 >= AI_MIN_INTERVAL_MS */
+let _lastAiAt = 0;
+async function aiPace() {
+  const wait = AI_MIN_INTERVAL_MS - (Date.now() - _lastAiAt);
+  if (wait > 0) await sleep(wait);
+  _lastAiAt = Date.now();
+}
 
 /* ---------------- 状态 ---------------- */
 
@@ -105,8 +119,9 @@ async function aiReply(notice) {
     max_tokens: 2000
   };
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      await aiPace();
       const res = await fetch(AI_API_URL, {
         method: 'POST',
         headers: {
@@ -117,11 +132,17 @@ async function aiReply(notice) {
         signal: AbortSignal.timeout(60000)
       });
 
-      // 这把 key 的组织上限只有 3 次/分钟，撞到限流就等一下再试一次
-      if (res.status === 429 && attempt === 1) {
-        console.log('   AI 限流(429)，3 秒后重试');
-        await sleep(3000);
-        continue;
+      // 组织上限 3 次/分钟。sleep(3s) 仍在同一个 60 秒滑窗内，必然继续 429，
+      // 所以这里退到 20 秒，最多再试 2 次。
+      if (res.status === 429) {
+        if (attempt < 3) {
+          console.log(`   AI 限流(429)，20 秒后重试（第 ${attempt} 次）`);
+          await sleep(20000);
+          _lastAiAt = 0;   // 重置节流，让重试能立刻发出去
+          continue;
+        }
+        console.log('   AI 持续限流，放弃本条，改兜底文案');
+        return '';
       }
       if (!res.ok) {
         console.log('   AI 接口返回', res.status, (await res.text()).slice(0, 200));
@@ -222,6 +243,28 @@ async function oneCycle(client, state, opts) {
   const state = loadState();
   const dryRun = !AUTO;
 
+  /* 首次运行：只认领、不发送。
+   * state.json 是空的，脚本不知道你手动回过的那些评论，直接真发会重复回一遍。
+   * 所以第一轮把窗口内的通知全部标记为已处理，从下一轮开始只回新留言。
+   * state 非空时这段永远不触发。 */
+  if (BOOTSTRAP && Object.keys(state.replied).length === 0) {
+    const list = await client.listReplies({ page: 1, perPage: 20 });
+    const nowBoot = Date.now();
+    let claimed = 0;
+    for (const item of list) {
+      const id = String(item.triggeredById || '');
+      if (!id) continue;
+      if ((nowBoot - (item.createdAt || 0)) / 3600000 > MAX_AGE_HOURS) continue;
+      state.replied[id] = { at: nowBoot, bootstrap: true };
+      claimed += 1;
+      const preview = String(item.comment || '').replace(/\s+/g, ' ').slice(0, 30);
+      console.log(`   [认领] ${item.senderName || item.senderOid || '?'}：「${preview}」`);
+    }
+    saveState(state);
+    console.log(`首次运行：已认领 ${claimed} 条历史通知，本轮不发送。下一轮起只回新留言。`);
+    process.exit(0);
+  }
+
   let total = 0;
   let fatal = '';
   for (let i = 1; i <= CYCLES; i++) {
@@ -244,6 +287,20 @@ async function oneCycle(client, state, opts) {
   console.log(`完成：本次共回复 ${total} 条，累计记录 ${Object.keys(state.replied).length} 条`);
 
   if (fatal) {
+    // Cookie 失效是「到期维护」而不是「代码崩了」。每 30 分钟让 run 变红会刷 48 封失败邮件/天，
+    // 所以同一个故障 24 小时内只报一次红的，其余静默退出（日志里仍有 warning）。
+    const nowFatal = Date.now();
+    const lastAuthFail = state.authFailAt || 0;
+    const sinceHours = (nowFatal - lastAuthFail) / 3600000;
+    state.authFailAt = nowFatal;
+    saveState(state);
+
+    if (sinceHours < AUTH_FAIL_THROTTLE_HOURS) {
+      console.log(`::warning::Cookie 已失效（${fatal}），${AUTH_FAIL_THROTTLE_HOURS} 小时内已报过一次，本次静默跳过。`);
+      console.log(`请重新从浏览器复制 Cookie，更新 CCW_COOKIE。上次报错在 ${Math.round(sinceHours)} 小时前。`);
+      process.exit(0);
+    }
+
     console.error('鉴权失败：' + fatal);
     console.error('这是 Cookie 失效（token 有效期约 16 天）。重新从浏览器复制 Cookie，更新 CCW_COOKIE。');
     process.exit(1);
