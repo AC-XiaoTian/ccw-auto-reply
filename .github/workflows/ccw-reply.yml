@@ -1,11 +1,12 @@
-# CCW 自动回复
+name: CCW 自动回复
 
 # ─── 节奏（2026-11-15 最终版）───
 # 实测：GitHub 对 5 分钟级 cron 大量降频。本仓库改 cron 前那两次 schedule 实际间隔 35 分钟
 #       （17:20 → 17:55），改完之后 19:02/19:07/19:12/19:17 四轮一次都没触发。
-# 所以不能只靠 cron。策略改成：cron 仍然每 5 分钟喊一次，但每次运行内部自己连续轮询
-#       4 轮 × 300 秒 ≈ 覆盖 20 分钟，把 cron 的空档填满，实际检测间隔稳定在 5 分钟。
-# 每次运行最多回 2 条/轮，没有新留言就直接空转，不发东西。
+# 另外 GitHub 的 cron 最小粒度就是 5 分钟，"每 3 分钟"这种 schedule 会被判无效。
+# 所以策略是：cron 仍然每 5 分钟喊一次，真正的检测频率由运行内部决定——
+#       单次运行连轮 6 轮 × 180 秒 ≈ 覆盖 18 分钟，检测间隔稳定在 3 分钟。
+# 每轮最多回 3 条；没有新留言就空转，不发东西。
 
 on:
   schedule:
@@ -34,8 +35,8 @@ concurrency:
 jobs:
   reply:
     runs-on: ubuntu-latest
-    # 4 轮 × 300 秒 ≈ 20 分钟，给足余量
-    timeout-minutes: 25
+    # 6 轮 × 180 秒 ≈ 18 分钟，每轮还要跑一会儿 AI，给到 30 分钟
+    timeout-minutes: 30
 
     steps:
       - name: 拉取代码
@@ -74,14 +75,16 @@ jobs:
           AI_SYSTEM_PROMPT: ${{ vars.AI_SYSTEM_PROMPT }}
 
           CCW_MAX_AGE_HOURS: "24"
-          CCW_MAX_PER_RUN: "2"
+          # 每轮最多回 3 条
+          CCW_MAX_PER_RUN: "3"
           # 「AI助手」这类账号你一回它就再发一条新通知，会形成回声循环，一律不回
           CCW_IGNORE_NICKNAMES: "AI助手"
           # 清脏数据：填了 id 就只删不回复
           CCW_DELETE_IDS: ${{ github.event.inputs.delete_ids }}
-          # 单次运行内部连轮 4 轮，每轮间隔 300 秒（约 5 分钟），用来填平 cron 的降频空档
-          CCW_CYCLES: "4"
-          CCW_CYCLE_GAP_SEC: "300"
+          # 单次运行内部连轮 6 轮、每轮间隔 180 秒（3 分钟）——GitHub cron 最小 5 分钟，
+          # "每 3 分钟检测"就靠这里实现，cron 只负责把运行叫醒
+          CCW_CYCLES: "6"
+          CCW_CYCLE_GAP_SEC: "180"
           # 首次运行只认领历史通知、不发送：state.json 是空的，脚本不知道你手动回过哪些，
           # 直接真发会重复回复。state 非空后这个开关就自动失效。
           CCW_BOOTSTRAP: "1"
@@ -98,7 +101,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 本轮状态先存一份出来。一轮要跑 20 分钟，期间远端可能已经被别的 commit 改过，
+          # 本轮状态先存一份出来。一轮要跑十几分钟，期间远端可能已经被别的 commit 改过，
           # 直接 push 会冲突（之前就是这样失败三次、状态没落盘、下一轮重复回复）。
           cp state.json "$RUNNER_TEMP/state-local.json"
           for i in 1 2 3; do
