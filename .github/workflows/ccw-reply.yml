@@ -24,9 +24,10 @@ on:
         type: string
         default: ""
 
-# 需要把 state.json 提交回仓库
+# 需要把 state.json 提交回仓库；失效提醒要能开 Issue
 permissions:
   contents: write
+  issues: write
 
 # 同一时间只跑一个实例，避免两轮互相覆盖状态
 concurrency:
@@ -105,7 +106,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 本轮状态先存一份出来。一轮要跑三十多分钟，期间远端可能已经被别的 commit 改过，
+          # 本轮状态先存一份出来。一轮要跑十几分钟，期间远端可能已经被别的 commit 改过，
           # 直接 push 会冲突（之前就是这样失败三次、状态没落盘、下一轮重复回复）。
           cp state.json "$RUNNER_TEMP/state-local.json"
           for i in 1 2 3; do
@@ -129,7 +130,16 @@ jobs:
           echo "::error::state.json 三次提交均失败，下一轮可能重复回复，请人工检查"
           exit 1
 
+      # Cookie 失效时自动开 Issue。没有这一步，失效就是「一声不响地停掉」，
+      # 因为鉴权失败被限流成 24 小时才报红一次，很容易错过。
+      - name: Cookie 失效时开 Issue 提醒
+        if: always() && steps.guard.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node cookie-alert.js
+
       - name: 失败时给出方向
         if: failure()
         run: |
-          echo "::warning::任务失败。最常见两个原因：① CCW 的 token 过期（有效期约 16 天）——重新从浏览器复制 Cookie 更新 CCW_COOKIE；② GitHub 机房 IP 被 CCW 风控——换国内云函数跑，代码不用改。"
+          echo "::warning::任务失败。最常见两个原因：① CCW 的登录态过期——重新从浏览器复制 Cookie 更新 CCW_COOKIE（失效时会自动开 Issue 提醒）；② GitHub 机房 IP 被 CCW 风控——换国内云函数跑，代码不用改。"
