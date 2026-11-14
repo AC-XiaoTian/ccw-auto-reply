@@ -1,13 +1,15 @@
 name: CCW 自动回复
 
 # ─── 节奏（2026-11-15 最终版）───
-# 每 5 分钟检测一次（GitHub 的 schedule 最小粒度就是 5 分钟）。
-# 检测频率 ≠ 发送量：每轮最多回 2 条，没有新留言就什么都不发。
-# 发送量只取决于新留言多少，不会因为查得勤就刷屏。
+# 实测：GitHub 对 5 分钟级 cron 大量降频。本仓库改 cron 前那两次 schedule 实际间隔 35 分钟
+#       （17:20 → 17:55），改完之后 19:02/19:07/19:12/19:17 四轮一次都没触发。
+# 所以不能只靠 cron。策略改成：cron 仍然每 5 分钟喊一次，但每次运行内部自己连续轮询
+#       4 轮 × 300 秒 ≈ 覆盖 20 分钟，把 cron 的空档填满，实际检测间隔稳定在 5 分钟。
+# 每次运行最多回 2 条/轮，没有新留言就直接空转，不发东西。
 
 on:
   schedule:
-    # 每 5 分钟，偏移 2 分起跳，避开整点拥堵
+    # 每 5 分钟（GitHub 实际会延迟，这里只当"叫醒"用）
     - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
   workflow_dispatch:
     inputs:
@@ -28,7 +30,8 @@ concurrency:
 jobs:
   reply:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 4 轮 × 300 秒 ≈ 20 分钟，给足余量
+    timeout-minutes: 25
 
     steps:
       - name: 拉取代码
@@ -68,8 +71,9 @@ jobs:
 
           CCW_MAX_AGE_HOURS: "24"
           CCW_MAX_PER_RUN: "2"
-          CCW_CYCLES: "1"
-          CCW_CYCLE_GAP_SEC: "150"
+          # 单次运行内部连轮 4 轮，每轮间隔 300 秒（约 5 分钟），用来填平 cron 的降频空档
+          CCW_CYCLES: "4"
+          CCW_CYCLE_GAP_SEC: "300"
           # 首次运行只认领历史通知、不发送：state.json 是空的，脚本不知道你手动回过哪些，
           # 直接真发会重复回复。state 非空后这个开关就自动失效。
           CCW_BOOTSTRAP: "1"
