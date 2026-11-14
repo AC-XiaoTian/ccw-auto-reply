@@ -137,19 +137,24 @@ class CCWClient {
   async replyToNotice(notice, content) {
     if (!notice) throw new Error('notice 为空');
     const type = notice.subjectType || 'CREATION';
+    // topic.outline 接口要求非空（"主体概览不能为空"）。留言板通知里 subjectOutline
+    // 有时为空，此时依次退到作品标题、对方昵称，最后兜一个固定词，避免整条 400。
+    const outline = String(
+      notice.subjectOutline || notice.subjectTitle || notice.senderName || notice.senderOid || '留言板'
+    );
     if (type === 'PROFILE') {
       // 留言板没有线程结构，回复 = 落到对方主页板上发新留言
       return this.post({
         subjectOid: notice.subjectOid,
         subjectType: 'PROFILE',
-        outline: notice.subjectOutline || '',
+        outline,
         content
       });
     }
     return this.reply({
       subjectOid: notice.subjectOid,
       subjectType: type,
-      outline: notice.subjectOutline || '',
+      outline,
       commentId: notice.triggeredById,
       content
     });
