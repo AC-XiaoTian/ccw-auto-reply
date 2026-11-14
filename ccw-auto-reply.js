@@ -210,9 +210,19 @@ async function oneCycle(client, state, opts) {
 
     const r = await client.replyToNotice(n, body);
     if (r && String(r.code) === '200') {
-      state.replied[String(n.triggeredById)] = { at: now, id: r.body && r.body.id };
+      const created = (r.body && r.body.id) || null;
+      const parent = (r.body && r.body.parentId) || null;
+      // 留言板：如果服务端没把它挂到原留言下（parentId 为空），就是在板上多发了一条独立留言，
+      // 用户看不到"回复"。这种情况立刻删掉这条，并且这次不再重试，避免反复制造脏数据。
+      if (n.subjectType === 'PROFILE' && !parent) {
+        console.log(`   留言板未支持嵌套（parentId 为空），已删除退回顶层的 id=${created}`);
+        if (created) await client.del(created);
+        state.replied[String(n.triggeredById)] = { at: now, nested: false, deleted: created };
+        continue;
+      }
+      state.replied[String(n.triggeredById)] = { at: now, id: created, parentId: parent };
       sent += 1;
-      console.log(`   已回复 ${who} -> commentId ${r.body && r.body.id}`);
+      console.log(`   已回复 ${who} -> commentId ${created}${parent ? ' parentId=' + parent : ''}`);
     } else {
       console.log(`   失败 ${who}: ${JSON.stringify(r).slice(0, 200)}`);
     }
