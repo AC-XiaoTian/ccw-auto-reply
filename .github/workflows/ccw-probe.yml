@@ -1,0 +1,24 @@
+name: CCW 接口探针
+
+# 临时工作流：只用来在真实登录态下探测接口，不参与自动回复。
+# 探完就可以删掉这个文件。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: 执行探针
+        env:
+          CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
+        run: node probe-actions.js
