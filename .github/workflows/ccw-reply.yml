@@ -40,17 +40,22 @@ jobs:
         with:
           node-version: "20"
 
-      - name: 检查 CCW_COOKIE 是否配置
+      # 没配 Cookie 时静默跳过，而不是每 5 分钟失败一次刷失败邮件
+      - name: 检查 CCW_COOKIE
+        id: guard
         env:
           CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
         run: |
           if [ -z "$CCW_COOKIE" ]; then
-            echo "::error::没有配置 CCW_COOKIE。请到 Settings → Secrets and variables → Actions 添加。"
-            exit 1
+            echo "::warning::未配置 CCW_COOKIE，本次跳过。到 Settings → Secrets and variables → Actions 添加后它就会自动开始跑。"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cookie 已配置，长度 ${#CCW_COOKIE}（内容不打印）"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "Cookie 已配置，长度 ${#CCW_COOKIE}（内容不打印）"
 
       - name: 执行自动回复
+        if: steps.guard.outputs.ready == 'true'
         env:
           CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
           # 定时任务真发；手动触发默认 dry-run，除非把勾去掉
@@ -69,7 +74,7 @@ jobs:
         run: node ccw-auto-reply.js
 
       - name: 保存去重状态
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' && steps.guard.outputs.ready == 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
