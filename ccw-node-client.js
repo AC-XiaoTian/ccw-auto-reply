@@ -143,11 +143,13 @@ class CCWClient {
       notice.subjectOutline || notice.subjectTitle || notice.senderName || notice.senderOid || '留言板'
     );
     if (type === 'PROFILE') {
-      // 留言板没有线程结构，回复 = 落到对方主页板上发新留言
-      return this.post({
+      // 留言板也想挂到原留言下面，所以同样带 replyToId 试一次；
+      // 服务端若不认（parentId 为空、退化成顶层新留言），由调用方负责删掉那条脏数据。
+      return this.reply({
         subjectOid: notice.subjectOid,
         subjectType: 'PROFILE',
         outline,
+        commentId: notice.triggeredById,
         content
       });
     }
