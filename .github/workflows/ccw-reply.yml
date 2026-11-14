@@ -1,15 +1,15 @@
 name: CCW 自动回复
 
-# ─── 关于"每 3 分钟" ───
-# GitHub 的 schedule 最小粒度是 5 分钟，这是硬限制，写 */3 无效。
-# 这里用 5 分钟触发 + 单次运行内轮询 2 轮（间隔 150 秒），
-# 实际大约 2.5~3 分钟一次。节奏由 CCW_CYCLES / CCW_CYCLE_GAP_SEC 控制。
-# 另外 GitHub 的 cron 有 5~30 分钟漂移，整点前后最严重。
+# ─── 节奏（2026-11-15 调整）───
+# GitHub 的 schedule 最小粒度是 5 分钟。原先是每 5 分钟 × 单次 2 轮 × 每轮 3 条，
+# 理论上限 72 条/小时（1728 条/天），在 CCW 上等于刷屏。
+# 现在：每 30 分钟触发一次、单次 1 轮、每轮最多 2 条 → 上限 4 条/小时（96 条/天），
+# 且受 AI 的 3 次/分钟限制约束，实际远低于此。
 
 on:
   schedule:
-    # 每 5 分钟，偏移 2 分钟起跳，避开整点拥堵
-    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+    # 每 30 分钟，偏移 2 分起跳，避开整点拥堵
+    - cron: "2,32 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -40,7 +40,7 @@ jobs:
         with:
           node-version: "20"
 
-      # 没配 Cookie 时静默跳过，而不是每 5 分钟失败一次刷失败邮件
+      # 没配 Cookie 时静默跳过，而不是每轮失败一次刷失败邮件
       - name: 检查 CCW_COOKIE
         id: guard
         env:
@@ -68,24 +68,42 @@ jobs:
           AI_SYSTEM_PROMPT: ${{ vars.AI_SYSTEM_PROMPT }}
 
           CCW_MAX_AGE_HOURS: "24"
-          CCW_MAX_PER_RUN: "3"
-          CCW_CYCLES: "2"
+          CCW_MAX_PER_RUN: "2"
+          CCW_CYCLES: "1"
           CCW_CYCLE_GAP_SEC: "150"
+          # 首次运行只认领历史通知、不发送：state.json 是空的，脚本不知道你手动回过哪些，
+          # 直接真发会重复回复。state 非空后这个开关就自动失效。
+          CCW_BOOTSTRAP: "1"
+          # AI 组织上限 3 次/分钟，两次调用最小间隔 21 秒
+          AI_MIN_INTERVAL_MS: "21000"
+          # Cookie 失效时同一个故障 24 小时内只报红一次，避免每轮刷失败邮件
+          CCW_AUTH_FAIL_THROTTLE_HOURS: "24"
         run: node ccw-auto-reply.js
 
       - name: 保存去重状态
-        if: github.event_name == 'schedule' && steps.guard.outputs.ready == 'true'
+        # always()：鉴权失败时也要把 authFailAt 存下来，否则限流计数永远不生效
+        if: always() && github.event_name == 'schedule' && steps.guard.outputs.ready == 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain state.json)" ]; then
-            git add state.json
-            git commit -m "state: $(date -u +%F_%H:%M) [skip ci]"
-            git pull --rebase --autostash
-            git push
-          else
+          if [ -z "$(git status --porcelain state.json)" ]; then
             echo "状态没有变化，跳过提交"
+            exit 0
           fi
+          git add state.json
+          git commit -m "state: $(date -u +%F_%H:%M) [skip ci]"
+          # push 可能因并发或网络失败。失败就不只是丢日志——下一轮会重发同一批评论，
+          # 所以重试三次，仍失败就显式报错。
+          for i in 1 2 3; do
+            if git pull --rebase --autostash && git push; then
+              echo "状态已提交（第 $i 次尝试）"
+              exit 0
+            fi
+            echo "push 失败，10 秒后重试（第 $i 次）"
+            sleep 10
+          done
+          echo "::error::state.json 三次提交均失败，下一轮可能重复回复，请人工检查"
+          exit 1
 
       - name: 失败时给出方向
         if: failure()
