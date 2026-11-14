@@ -243,11 +243,11 @@ async function oneCycle(client, state, opts) {
   const state = loadState();
   const dryRun = !AUTO;
 
-  /* 首次运行：只认领、不发送。
+  /* 首次运行（真实发送模式）：只认领、不发送。
    * state.json 是空的，脚本不知道你手动回过的那些评论，直接真发会重复回一遍。
-   * 所以第一轮把窗口内的通知全部标记为已处理，从下一轮开始只回新留言。
-   * state 非空时这段永远不触发。 */
-  if (BOOTSTRAP && Object.keys(state.replied).length === 0) {
+   * dry-run 不走这里，这样你手动预览仍能看到将要回的内容。
+   * state 非空后这段永远不触发。 */
+  if (BOOTSTRAP && !dryRun && Object.keys(state.replied).length === 0) {
     const list = await client.listReplies({ page: 1, perPage: 20 });
     const nowBoot = Date.now();
     let claimed = 0;
