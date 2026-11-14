@@ -6,12 +6,15 @@
  *   拉「回复我的」通知(/notification/page COMMENT_TO_ME)
  *   -> 按 ID 去重（state.json）
  *   -> AI 生成一句回复（AI 不可用时退回兜底文案）
- *   -> /comment/create 发回（作品评论带 replyToId，留言板不带）
+ *   -> /comment/create 发回（作品评论、主页留言板都带 replyToId，挂在原留言下面）
+ *   -> 校验返回体 parentId；留言板若退化成顶层新留言就立刻删掉
  *   -> 记录状态
  *
  * 环境变量：
  *   CCW_COOKIE         必填，"token=...; cookie-user-id=..."
  *   CCW_AUTO_REPLY     '1' 才真发；否则 dry-run 只打印
+ *   CCW_IGNORE_NICKNAMES  逗号分隔的昵称黑名单，这些账号发来的通知一律不回，默认 AI助手
+ *   CCW_DELETE_IDS     逗号分隔的评论 id，只做删除、不回复（清脏数据用）
  *   AI_API_URL         留空即用内置的 Moonshot 地址
  *   AI_API_KEY         AI 的 key；不填则全部走兜底文案，不会崩
  *   AI_MODEL           模型名，默认 kimi-k3
@@ -35,6 +38,16 @@ const MAX_PER_RUN = Number(process.env.CCW_MAX_PER_RUN || '3');
 const CYCLES = Number(process.env.CCW_CYCLES || '2');
 const GAP_SEC = Number(process.env.CCW_CYCLE_GAP_SEC || '150');
 const STATE_FILE = process.env.CCW_STATE_FILE || './state.json';
+
+/* 昵称黑名单：实测「AI助手」这类账号，你一回它它又发一条新通知回来，
+ * 会形成回声循环，一轮一条无限往下滚。这类账号一律不回。
+ * 用 CCW_IGNORE_NICKNAMES 可以把别的官方号 / 机器人也加进来（逗号分隔）。 */
+const IGNORE_NICKNAMES = (process.env.CCW_IGNORE_NICKNAMES || 'AI助手')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
+/* 清脏数据模式：只删不回复，传 ids 就退出主流程 */
+const DELETE_IDS = (process.env.CCW_DELETE_IDS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 /* AI 默认指向 Moonshot(kimi)；AI_API_URL / AI_MODEL 留空即用这里的默认值。
  * 不填 AI_API_KEY 也不会崩，只是全部走兜底文案。 */
@@ -187,6 +200,13 @@ async function oneCycle(client, state, opts) {
       const id = String(n.triggeredById || '');
       if (!id) return false;
       if (state.replied[id]) return false;
+      // 黑名单：AI助手这类账号自问自答式回复会形成回声循环
+      const nick = String(n.senderName || '');
+      if (IGNORE_NICKNAMES.some((x) => nick.includes(x))) {
+        console.log(`   跳过 ${nick}（在黑名单里，避免回声循环）`);
+        state.replied[id] = { at: now, ignored: nick };
+        return false;
+      }
       const age = (now - (n.createdAt || 0)) / 3600000;
       return age <= MAX_AGE_HOURS;
     })
@@ -249,6 +269,22 @@ async function oneCycle(client, state, opts) {
     process.exit(1);
   }
   console.log('签名就绪');
+
+  /* 清脏数据模式：CCW_DELETE_IDS 传了 id 就只删不回复，删完直接退出。
+   * 用来清掉历史遗留的「退回顶层的独立留言」和自己给自己发的测试留言。 */
+  if (DELETE_IDS.length) {
+    console.log(`删除模式：${DELETE_IDS.join(', ')}`);
+    for (const id of DELETE_IDS) {
+      try {
+        const r = await client.del(id);
+        console.log(`   delete ${id} -> ${JSON.stringify(r).slice(0, 120)}`);
+      } catch (e) {
+        console.log(`   delete ${id} 失败: ${e.message}`);
+      }
+      await sleep(2000);
+    }
+    process.exit(0);
+  }
 
   const state = loadState();
   const dryRun = !AUTO;
