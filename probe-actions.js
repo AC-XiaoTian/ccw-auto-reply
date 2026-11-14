@@ -1,71 +1,47 @@
-/* 探针 v4：
- * 1) 确认我是谁（拿自己的 studentOid）
- * 2) 列我自己的作品，拿一个自己的作品 oid
- * 3) 点赞：试 {creationOid, oid, action} 组合，看 oid 到底指哪个
- * 4) 置顶：在自己作品的评论区找一条评论 id，再试 /study-community/comment/top
+/* 探针 v5：目标只剩置顶。
+ * A) 试出「读某作品评论列表」的正确参数（拿到自己作品下的评论 id）
+ * B) 用那条评论 id 试置顶：/study-community/comment/top、/featured_comment/*
  */
 'use strict';
 
 const { CCWClient } = require('./ccw-node-client');
 
 const show = (label, r) => {
-  let s;
-  try { s = JSON.stringify(r); } catch { s = String(r); }
-  console.log(label + ' => ' + (s || '').slice(0, 240));
+  let s; try { s = JSON.stringify(r); } catch { s = String(r); }
+  console.log(label + ' => ' + (s || '').slice(0, 220));
 };
-const brief = (o) => JSON.stringify(o || {}).slice(0, 300);
+const brief = (o) => JSON.stringify(o || {}).slice(0, 220);
 
 (async () => {
-  const cookie = process.env.CCW_COOKIE || '';
-  const uid = (cookie.match(/cookie-user-id=([^;]+)/) || [])[1] || '';
-  const c = new CCWClient({ cookie });
+  const c = new CCWClient({ cookie: process.env.CCW_COOKIE || '' });
   await c.init();
 
-  // 1) 我是谁
-  show('student/current', await c._signed('/student/current', {}, { retry: true }));
-  show('member/detail', await c._signed('/study-community/member/detail', { oid: uid }, { retry: true }));
+  const OWN = '6adbfdc01f19651c11fb2cc8'; // CCW CSP的防护拦截（我自己的作品）
+  const REL = '6aef0ddfc3024779b57fa522';
 
-  // 2) 我自己的作品
-  const own = await c._signed('/creation/own/page', { page: 1, perPage: 10 }, { retry: true });
-  console.log('own/page: ' + brief(own));
-  let oid = '';
-  const list = (own && own.body && (own.body.data || own.body.list)) || [];
-  if (list.length) {
-    oid = list[0].oid || list[0].creationOid || '';
-    console.log('取到自己作品: ' + oid + ' title=' + (list[0].title || ''));
-  }
-
-  if (!oid) {
-    console.log('拿不到自己的作品 oid，后续测试中止');
-    return;
-  }
-
-  const d = await c._signed('/creation/detail', { oid }, { retry: true });
-  const body = (d && d.body) || {};
-  const relOid = (body.creationRelease && (body.creationRelease.oid || body.creationRelease.releaseOid)) || '';
-  console.log('作品 oid=' + (body.oid || oid) + ' | creationRelease.oid=' + relOid + ' | student.oid=' + ((body.student || {}).oid || ''));
-
-  // 3) 点赞组合
-  const combos = [
-    ['{creationOid,action:LIKE}', { creationOid: oid, action: 'LIKE' }],
-    ['{creationOid,oid:rel,action:LIKE}', { creationOid: oid, oid: relOid, action: 'LIKE' }],
-    ['{oid:creation,action:LIKE}', { oid, action: 'LIKE' }],
-    ['{creationOid,creationReleaseOid,action:LIKE}', { creationOid: oid, creationReleaseOid: relOid, action: 'LIKE' }]
+  // A) 评论列表参数候选
+  const listTries = [
+    ['{topicOid}', { topicOid: OWN, page: 1, perPage: 10 }],
+    ['{topicId}', { topicId: OWN, page: 1, perPage: 10 }],
+    ['{id}', { id: OWN, page: 1, perPage: 10 }],
+    ['{subjectId}', { subjectId: OWN, page: 1, perPage: 10 }],
+    ['{oid}', { oid: OWN, page: 1, perPage: 10 }],
+    ['{creationOid}', { creationOid: OWN, page: 1, perPage: 10 }],
+    ['{creationReleaseOid}', { creationReleaseOid: REL, page: 1, perPage: 10 }]
   ];
-  for (const [label, payload] of combos) show('like ' + label, await c._signed('/creation_stats/like', payload));
+  for (const [label, p] of listTries) show('comment/page ' + label, await c._signed('/comment/page', p, { retry: true }));
 
-  // 4) 自己作品下的评论 → 置顶
-  const cm = await c._signed('/comment/page', { subjectOid: oid, subjectType: 'CREATION', page: 1, perPage: 10 }, { retry: true });
-  console.log('comment/page: ' + brief(cm));
-  const comments = (cm && cm.body && (cm.body.data || cm.body.list)) || [];
-  if (comments.length) {
-    const firstId = comments[0].id || comments[0].commentId;
-    console.log('自己作品下的评论 id=' + firstId + ' by=' + ((comments[0].student || {}).nickname || ''));
-    show('top {id}', await c._signed('/study-community/comment/top', { id: Number(firstId) }));
-    show('allow_update_weight {id}', await c._signed('/study-community/comment/allow_update_weight', { id: Number(firstId) }, { retry: true }));
-  } else {
-    console.log('没取到评论列表，置顶仍未测');
+  // 换成 /featured_comment/page 看能不能读到（这个是前端确实在用的）
+  show('featured_comment/page {creationOid}', await c._signed('/featured_comment/page?page=1&perPage=10', { creationOid: OWN, page: 1, perPage: 10 }, { retry: true }));
+
+  // B) 置顶候选（先用刚才通知里那条别人的评论 id 试路径是否存在，再看自己作品）
+  const OTHER_CID = 10289497;
+  for (const p of ['/featured_comment/create', '/featured_comment/add', '/featured_comment/upsert', '/featured_comment/delete']) {
+    show('B ' + p, await c._signed(p, { id: OTHER_CID, commentId: OTHER_CID, creationOid: OWN }));
   }
 
-  console.log('v4 探测结束');
+  // C) 自己作品下的置顶（若 A 步拿到 id 才有意义；这里固定再试一次以确认权限位）
+  show('C top {id:' + OTHER_CID + ',creationOid}', await c._signed('/study-community/comment/top', { id: OTHER_CID, creationOid: OWN }));
+
+  console.log('v5 探测结束');
 })().catch((e) => { console.error('探测出错:', e.message); process.exit(1); });
