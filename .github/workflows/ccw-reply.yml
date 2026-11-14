@@ -1,0 +1,88 @@
+name: CCW 自动回复
+
+# ─── 关于"每 3 分钟" ───
+# GitHub 的 schedule 最小粒度是 5 分钟，这是硬限制，写 */3 无效。
+# 这里用 5 分钟触发 + 单次运行内轮询 2 轮（间隔 150 秒），
+# 实际大约 2.5~3 分钟一次。节奏由 CCW_CYCLES / CCW_CYCLE_GAP_SEC 控制。
+# 另外 GitHub 的 cron 有 5~30 分钟漂移，整点前后最严重。
+
+on:
+  schedule:
+    # 每 5 分钟，偏移 2 分钟起跳，避开整点拥堵
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只打印要回复什么，不真的发送"
+        type: boolean
+        default: true
+
+# 需要把 state.json 提交回仓库
+permissions:
+  contents: write
+
+# 同一时间只跑一个实例，避免两轮互相覆盖状态
+concurrency:
+  group: ccw-auto-reply
+  cancel-in-progress: false
+
+jobs:
+  reply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 检查 CCW_COOKIE 是否配置
+        env:
+          CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
+        run: |
+          if [ -z "$CCW_COOKIE" ]; then
+            echo "::error::没有配置 CCW_COOKIE。请到 Settings → Secrets and variables → Actions 添加。"
+            exit 1
+          fi
+          echo "Cookie 已配置，长度 ${#CCW_COOKIE}（内容不打印）"
+
+      - name: 执行自动回复
+        env:
+          CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
+          # 定时任务真发；手动触发默认 dry-run，除非把勾去掉
+          CCW_AUTO_REPLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && '0' || '1' }}
+
+          # AI（不配就走兜底文案，不会报错）
+          AI_API_URL: ${{ vars.AI_API_URL }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_SYSTEM_PROMPT: ${{ vars.AI_SYSTEM_PROMPT }}
+
+          CCW_MAX_AGE_HOURS: "24"
+          CCW_MAX_PER_RUN: "3"
+          CCW_CYCLES: "2"
+          CCW_CYCLE_GAP_SEC: "150"
+        run: node ccw-auto-reply.js
+
+      - name: 保存去重状态
+        if: github.event_name == 'schedule'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git add state.json
+            git commit -m "state: $(date -u +%F_%H:%M) [skip ci]"
+            git pull --rebase --autostash
+            git push
+          else
+            echo "状态没有变化，跳过提交"
+          fi
+
+      - name: 失败时给出方向
+        if: failure()
+        run: |
+          echo "::warning::任务失败。最常见两个原因：① CCW 的 token 过期（有效期约 16 天）——重新从浏览器复制 Cookie 更新 CCW_COOKIE；② GitHub 机房 IP 被 CCW 风控——换国内云函数跑，代码不用改。"
