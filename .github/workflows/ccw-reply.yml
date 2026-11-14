@@ -1,4 +1,4 @@
-name: CCW 自动回复
+# CCW 自动回复
 
 # ─── 节奏（2026-11-15 最终版）───
 # 实测：GitHub 对 5 分钟级 cron 大量降频。本仓库改 cron 前那两次 schedule 实际间隔 35 分钟
@@ -17,6 +17,10 @@ on:
         description: "只打印要回复什么，不真的发送"
         type: boolean
         default: true
+      delete_ids:
+        description: "要删除的评论 id（逗号分隔），填了就只删不回复，用来清脏数据"
+        type: string
+        default: ""
 
 # 需要把 state.json 提交回仓库
 permissions:
@@ -71,6 +75,10 @@ jobs:
 
           CCW_MAX_AGE_HOURS: "24"
           CCW_MAX_PER_RUN: "2"
+          # 「AI助手」这类账号你一回它就再发一条新通知，会形成回声循环，一律不回
+          CCW_IGNORE_NICKNAMES: "AI助手"
+          # 清脏数据：填了 id 就只删不回复
+          CCW_DELETE_IDS: ${{ github.event.inputs.delete_ids }}
           # 单次运行内部连轮 4 轮，每轮间隔 300 秒（约 5 分钟），用来填平 cron 的降频空档
           CCW_CYCLES: "4"
           CCW_CYCLE_GAP_SEC: "300"
@@ -85,21 +93,26 @@ jobs:
 
       - name: 保存去重状态
         # always()：鉴权失败时也要把 authFailAt 存下来，否则限流计数永远不生效
-        # 手动跑真实发送（dry_run=false）也提交，这样首跑的「认领」能立刻落盘
-        if: always() && steps.guard.outputs.ready == 'true' && (github.event_name == 'schedule' || github.event.inputs.dry_run == 'false')
+        # 删除模式不碰状态；手动跑真实发送（dry_run=false）也提交，这样首跑的「认领」能立刻落盘
+        if: always() && steps.guard.outputs.ready == 'true' && !github.event.inputs.delete_ids && (github.event_name == 'schedule' || github.event.inputs.dry_run == 'false')
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -z "$(git status --porcelain state.json)" ]; then
-            echo "状态没有变化，跳过提交"
-            exit 0
-          fi
-          git add state.json
-          git commit -m "state: $(date -u +%F_%H:%M) [skip ci]"
-          # push 可能因并发或网络失败。失败就不只是丢日志——下一轮会重发同一批评论，
-          # 所以重试三次，仍失败就显式报错。
+          # 本轮状态先存一份出来。一轮要跑 20 分钟，期间远端可能已经被别的 commit 改过，
+          # 直接 push 会冲突（之前就是这样失败三次、状态没落盘、下一轮重复回复）。
+          cp state.json "$RUNNER_TEMP/state-local.json"
           for i in 1 2 3; do
-            if git pull --rebase --autostash && git push; then
+            git fetch origin main
+            git reset --hard origin/main
+            # 把本轮新增的记录并进远端最新版，而不是覆盖
+            node merge-state.js "$RUNNER_TEMP/state-local.json" state.json
+            if [ -z "$(git status --porcelain state.json)" ]; then
+              echo "状态没有变化，跳过提交"
+              exit 0
+            fi
+            git add state.json
+            git commit -m "state: $(date -u +%F_%H:%M) [skip ci]"
+            if git push origin HEAD:main; then
               echo "状态已提交（第 $i 次尝试）"
               exit 0
             fi
