@@ -12,10 +12,10 @@
  * 环境变量：
  *   CCW_COOKIE         必填，"token=...; cookie-user-id=..."
  *   CCW_AUTO_REPLY     '1' 才真发；否则 dry-run 只打印
- *   AI_API_URL         OpenAI 兼容的 chat/completions 地址；留空则不用 AI
- *   AI_API_KEY         AI 的 key
- *   AI_MODEL           模型名，默认 gpt-4o-mini
- *   AI_SYSTEM_PROMPT   可选，自定义回复风格
+ *   AI_API_URL         留空即用内置的 Moonshot 地址
+ *   AI_API_KEY         AI 的 key；不填则全部走兜底文案，不会崩
+ *   AI_MODEL           模型名，默认 kimi-k3
+ *   AI_SYSTEM_PROMPT   填了就整段替换内置人设
  *   CCW_REPLY_TEXT     可选，固定文案（AI 不可用时的兜底）
  *   CCW_MAX_AGE_HOURS  只回复多少小时内的通知，默认 24
  *   CCW_MAX_PER_RUN    单次运行最多回复几条，默认 3
@@ -36,12 +36,26 @@ const CYCLES = Number(process.env.CCW_CYCLES || '2');
 const GAP_SEC = Number(process.env.CCW_CYCLE_GAP_SEC || '150');
 const STATE_FILE = process.env.CCW_STATE_FILE || './state.json';
 
-const AI_API_URL = (process.env.AI_API_URL || '').trim();
+/* AI 默认指向 Moonshot(kimi)；AI_API_URL / AI_MODEL 留空即用这里的默认值。
+ * 不填 AI_API_KEY 也不会崩，只是全部走兜底文案。 */
+const AI_API_URL = (process.env.AI_API_URL || '').trim() ||
+  'https://api.moonshot.cn/v1/chat/completions';
 const AI_API_KEY = (process.env.AI_API_KEY || '').trim();
-const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
-const AI_SYSTEM_PROMPT = process.env.AI_SYSTEM_PROMPT ||
-  '你在共创世界的评论区回复网友。中文、口语化、不超过 40 字，' +
-  '不要自称 AI，不要提模型，不要长篇大论，直接给一句自然得体的回应。';
+const AI_MODEL = (process.env.AI_MODEL || '').trim() || 'kimi-k3';
+
+/* 人设：AC小天 本人在 CCW 的语气。想换风格只改这一处（或用 AI_SYSTEM_PROMPT 覆盖） */
+const AI_SYSTEM_PROMPT = (process.env.AI_SYSTEM_PROMPT || '').trim() || [
+  '你是"小天"，在共创世界（CCW）上做游戏和小工具的作者，正在回复自己作品评论区或主页留言板上的留言。',
+  '语气：干脆、实在、有点皮但不油，像个二十多岁的技术宅，不像客服，也不像陪聊。',
+  '硬性要求：',
+  '1. 只说中文，一句话，20~30 个字，能短不长；',
+  '2. 不自称 AI，不提模型、不提"助手""系统"；',
+  '3. 不要编造游戏机制、关卡细节、道具名称——不了解就别提具体的，宁可说通用的话；',
+  '4. 不承诺任何具体事情：不保证更新时间、不发资源链接、不留联系方式、不提加群；',
+  '5. 被夸就老实道谢再补一句实在话；被问就正面回应，不确定就说"这个我还没试过"；',
+  '6. 不用"亲""宝子""集美"，不堆叹号，最多一个表情，也可以不用；',
+  '7. 不复读对方原话，不反问"要不要一起玩""加个好友"这类引导。'
+].join('\n');
 
 const FALLBACK_TEXT = process.env.CCW_REPLY_TEXT || '';
 
@@ -85,32 +99,47 @@ async function aiReply(notice) {
         content: `有人在我的${notice.subjectType === 'PROFILE' ? '主页留言板' : '作品评论区'}留言：「${incoming}」。\n请回一句。`
       }
     ],
-    temperature: 0.7,
-    max_tokens: 120
+    temperature: 1,        // kimi-k3 只接受 1，写 0.7 会直接 400 invalid temperature
+    // kimi 是推理模型：思考过程也计入 max_tokens。实测一条回复 reasoning≈470 token、
+    // 正文只有≈30 token，给 120 或 800 都会返回空 content，给 2000 才稳。
+    max_tokens: 2000
   };
 
-  try {
-    const res = await fetch(AI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${AI_API_KEY}`
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(20000)
-    });
-    if (!res.ok) {
-      console.log('   AI 接口返回', res.status, (await res.text()).slice(0, 200));
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(AI_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${AI_API_KEY}`
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(60000)
+      });
+
+      // 这把 key 的组织上限只有 3 次/分钟，撞到限流就等一下再试一次
+      if (res.status === 429 && attempt === 1) {
+        console.log('   AI 限流(429)，3 秒后重试');
+        await sleep(3000);
+        continue;
+      }
+      if (!res.ok) {
+        console.log('   AI 接口返回', res.status, (await res.text()).slice(0, 200));
+        return '';
+      }
+
+      const data = await res.json();
+      const text = (data.choices && data.choices[0] && data.choices[0].message &&
+        data.choices[0].message.content) || '';
+      const out = clean(text);
+      if (!out) console.log('   AI 返回空内容（多半是 max_tokens 不够），改用兜底文案');
+      return out;
+    } catch (e) {
+      console.log('   AI 调用失败:', e.message);
       return '';
     }
-    const data = await res.json();
-    const text = (data.choices && data.choices[0] && data.choices[0].message &&
-      data.choices[0].message.content) || '';
-    return clean(text);
-  } catch (e) {
-    console.log('   AI 调用失败:', e.message);
-    return '';
   }
+  return '';
 }
 
 /* 评论框里放不下换行，压成单行并限长 */
@@ -166,8 +195,8 @@ async function oneCycle(client, state, opts) {
     } else {
       console.log(`   失败 ${who}: ${JSON.stringify(r).slice(0, 200)}`);
     }
-    // 间隔随机化，别用固定节奏
-    await sleep(rand(2500, 6000));
+    // 间隔随机化：既防风控，也避开 AI 的 3 次/分钟限流
+    await sleep(rand(8000, 14000));
   }
   return sent;
 }
