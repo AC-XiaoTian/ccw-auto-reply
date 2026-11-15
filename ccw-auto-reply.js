@@ -99,7 +99,15 @@ const AI_SYSTEM_PROMPT = (process.env.AI_SYSTEM_PROMPT || '').trim() || [
   '5. 被夸就真心道谢再补一句实在话；被问就正面回应，不确定就说"这个我还没试过"；',
   '6. 不用"亲""宝子""集美"这类电商口吻，不堆叹号，最多一个表情；',
   '7. 不复读对方原话，不硬拉人玩；',
-  '8. "主人"这个词只属于 AC小天 本人，对其他人一律不能出现，也不能说"主人做的""主人说"这种话。'
+  '8. "主人"这个词只属于 AC小天 本人，对其他人一律不能出现，也不能说"主人做的""主人说"这种话。',
+  '',
+  '动作（能做就做，拿不准就不做）：',
+  '9. 对方明显在夸你、说喜欢这个作品、要收藏或推荐时，把这条置顶（pin 填 true）；客套式的夸就算了；',
+  '10. 对方骂人、人身攻击、发广告引流时，删掉这条（delete 填 true）并且 reply 留空；单纯吐槽或提意见不算，照常回；',
+  '11. 对方贴了 CCW 作品链接（ccw.site 域名或 /detail/xxx）又说"给我点个赞""求赞"，把作品 oid 填进 like_oid；没求赞就留空。',
+  '',
+  '只输出一个 JSON，不要代码块、不要额外解释：',
+  '{"reply":"要说的话","pin":false,"delete":false,"like_oid":""}'
 ].join('\n');
 
 /* 主人识别：oid 优先，昵称兜底。命中就追加下面这段专属指令。
@@ -191,7 +199,7 @@ async function aiDecision(notice) {
         role: 'user',
         content: `有人在我的${notice.subjectType === 'PROFILE' ? '主页留言板' : '作品评论区'}留言：「${incoming}」。\n` +
           (master ? '这条是主人 AC小天 本人发的，按上面的主人规则回。\n' : '') +
-          '回一句，只输出 JSON，格式：{"reply":"要说的话"}'
+          '回一句，只输出 JSON，格式：{"reply":"要说的话","pin":false,"delete":false,"like_oid":""}'
       }
     ],
     temperature: 1,        // kimi-k3 只接受 1，写 0.7 会直接 400 invalid temperature
