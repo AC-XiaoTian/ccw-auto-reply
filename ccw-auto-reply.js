@@ -43,6 +43,11 @@ const COOKIE = (process.env.CCW_COOKIE || '').trim();
 /* 第二份 Cookie：蔚小喵自己的账号。回复用它发，删除/点赞/置顶用板主账号。
  * 空着就退回单账号行为。 */
 const BOT_COOKIE = (process.env.CCW_COOKIE_BOT || '').trim();
+
+/* 谁有资格「说话」：只认这个 oid（蔚小喵）。两份 Cookie 里哪份是它，按 cookie-user-id 认，
+ * 不按顺序猜。这样即使只有她主人的 Cookie 活着，也不会拿主人的号替她回复。
+ * 想换人设账号就改这个环境变量，不用改代码。 */
+const ACTOR_OID = (process.env.CCW_ACTOR_OID || '6a2804f986bbc77f84e60cdf').trim();
 const AUTO = process.env.CCW_AUTO_REPLY === '1';
 const MAX_AGE_HOURS = Number(process.env.CCW_MAX_AGE_HOURS || '24');
 const MAX_PER_RUN = Number(process.env.CCW_MAX_PER_RUN || '3');
@@ -247,10 +252,22 @@ function pickText(notice, aiText) {
 async function oneCycle(clients, state, opts) {
   const { round, dryRun } = opts;
 
-  /* 板主账号列：AC小天 一份；蔚小喵 新号另起一份（同一份 Cookie 就不重复拉）。 */
-  const boards = [{ key: 'owner', label: 'AC小天', client: clients.owner }];
+  /* 发言账号只能是「蔚小喵」本人：按 Cookie 里的 oid 认人，不按环境变量顺序猜。
+   * 之前吃过亏——唯一活着的 Cookie 是她主人的号，代码就顺手用它发了，
+   * 结果所有回复都挂在 AC小天 名下，看着像「自己回自己」，用户完全看不到是她在回。
+   * 所以这里先定死发言账号，定不出来就一条都不发。 */
+  const actorClient = clients.actor;
+  if (!actorClient) {
+    console.log(`[第 ${round} 轮]::warning::没有 ${ACTOR_OID}（蔚小喵）的可用登录态，本轮不发任何回复。`);
+    return 0;
+  }
+
+  /* 读通知：谁的 Cookie 活着就拉谁的通知。
+   * 板主账号（AC小天）的通知里带着「你留言板上的新留言」，这是覆盖他留言板的入口；
+   * 蔚小喵自己的通知覆盖她自己的板。两路合并、按 commentId 去重。 */
+  const boards = [{ key: 'owner', label: 'CCW_COOKIE', client: clients.owner }];
   if (clients.bot && clients.bot !== clients.owner) {
-    boards.push({ key: 'bot', label: '蔚小喵自己的账号', client: clients.bot });
+    boards.push({ key: 'bot', label: 'CCW_COOKIE_BOT', client: clients.bot });
   }
 
   const bucket = [];
@@ -301,8 +318,7 @@ async function oneCycle(clients, state, opts) {
     const preview = String(n.comment || '').replace(/\s+/g, ' ').slice(0, 40);
     // 板主账号：删评论 / 点赞 / 置顶 都要板主权限，用通知来源那份 Cookie
     const boardClient = n._board === 'bot' ? clients.bot : clients.owner;
-    // 发言账号：所有回复都用蔚小喵身份发出，这样它能出现在两个人的留言板下
-    const actorClient = clients.bot || clients.owner;
+    // 发言账号：固定用蔚小喵（函数开头已锁定），这样回谁都是她的口吻
     const asBot = actorClient !== boardClient;
 
     const act = await aiDecision(n);
@@ -392,7 +408,7 @@ async function oneCycle(clients, state, opts) {
   /* 第二份 Cookie：蔚小喵新号。它既用来发回复（两个留言板都用它的身份），
    * 也用来读它自己那边的通知。没配就退回「谁的通知谁回」。 */
   const botClient = BOT_COOKIE ? new CCWClient({ cookie: BOT_COOKIE }) : null;
-  const clients = { owner: client, bot: client };
+  const clients = { owner: client, bot: client, actor: null };
 
   /* 身份输出：Cookie 里的 cookie-user-id 就是账号 oid（和 CCW 页面 URL 里那个一致）。
    * 出问题时不用猜「到底哪份 Cookie 是哪个号」，一眼能看出来。
@@ -403,6 +419,7 @@ async function oneCycle(clients, state, opts) {
   };
   console.log('CCW_COOKIE     身份 oid=' + oidOf(COOKIE));
   if (BOT_COOKIE) console.log('CCW_COOKIE_BOT 身份 oid=' + oidOf(BOT_COOKIE));
+  console.log('期望的发言账号（蔚小喵）oid=' + ACTOR_OID);
 
   try {
     await client.init();
@@ -415,35 +432,53 @@ async function oneCycle(clients, state, opts) {
   }
   console.log('签名就绪');
 
-  /* 第二份 Cookie（蔚小喵账号）：只在它真的能读通知时才启用。
-   * 两个坑：
-   *   1. init() 只取签名密钥，health/check 无论有没有登录都返回正常，签名成功 ≠ session 活着；
-   *   2. 它一旦抛错，绝不能把主号一起带崩（最初版本就是这么写的，第二份 Cookie 一失效整轮全挂）。
-   * 所以这里单独 try，并且额外做一次真正需要身份的读通知，失败就退化成单账号。 */
+  /* 两份 Cookie 各自验活：init() 只取签名密钥，health/check 不管有没有登录都返回正常，
+   * 签名成功 ≠ session 活着，必须真读一次通知才看得出来。 */
+  const alive = new Map();
+  const checkAlive = async (label, c) => {
+    try {
+      const probe = await c.listReplies({ page: 1, perPage: 1 });
+      alive.set(c, Array.isArray(probe));
+      if (!Array.isArray(probe)) throw new Error('读通知返回非数组');
+      return true;
+    } catch (e) {
+      alive.set(c, false);
+      console.log('::warning::' + label + ' 登录态不可用（' + String(e.message).slice(0, 90) + '）');
+      return false;
+    }
+  };
+
   if (BOT_COOKIE) {
     try {
       await botClient.init();
-      const probe = await botClient.listReplies({ page: 1, perPage: 1 });
-      if (!Array.isArray(probe)) throw new Error('读通知返回非数组');
-      clients.bot = botClient;
-      console.log('第二份 Cookie（CCW_COOKIE_BOT）可用，回复将以它的身份发出');
+      const ok = await checkAlive('CCW_COOKIE_BOT', botClient);
+      if (ok) clients.bot = botClient;
     } catch (e) {
-      console.log('::warning::第二份 Cookie 不可用（' + String(e.message).slice(0, 90) +
-        '），本次退化成单账号，只用 CCW_COOKIE 那个账号读通知并回复。');
+      alive.set(botClient, false);
+      console.log('::warning::CCW_COOKIE_BOT 初始化失败（' + String(e.message).slice(0, 90) + '）');
     }
   }
+  await checkAlive('CCW_COOKIE', client);
 
-  /* 主号 Cookie 也顺手验一次活：401 不会在 init() 阶段暴露，只有带身份的接口才会。
-   * 这里失败不退出——下一轮 oneCycle 会按「拉通知失败」记日志；但如果两份都挂，
-   * 那就是真的没法干活，得让本次运行报红，避免密码失效后静默空转。 */
-  try {
-    await client.listReplies({ page: 1, perPage: 1 });
-  } catch (e) {
-    console.log('::warning::主号 Cookie 读通知失败：' + String(e.message).slice(0, 90));
-    if (clients.bot === client) {
-      console.error('两份 Cookie 都不可用，本次无法回复。请更新 CCW_COOKIE / CCW_COOKIE_BOT。');
-      process.exit(1);
+  /* 定发言账号：只认 Cookie 里 cookie-user-id 等于 ACTOR_OID 的那一份，并且必须活着。
+   * 定不出来就 clients.actor 为空，oneCycle 会整轮跳过——绝不用别人的号替她说话。 */
+  for (const c of [client, BOT_COOKIE ? botClient : null].filter(Boolean)) {
+    if (c.selfOid === ACTOR_OID && alive.get(c)) {
+      clients.actor = c;
+      break;
     }
+  }
+  if (clients.actor) {
+    console.log('发言账号已锁定：蔚小喵（' + ACTOR_OID + '），所有回复都以它的身份发出');
+  } else {
+    console.log('::warning::没有可用的蔚小喵登录态（' + ACTOR_OID + '），' +
+      '本轮不会发出任何回复。请把蔚小喵被抓取时的 Cookie 填进对应 secret。');
+  }
+
+  /* 两个账号都读不了通知 = 什么都干不了，报红，避免静默空转。 */
+  if (![...alive.values()].some(Boolean)) {
+    console.error('两份 Cookie 都不可用，本次无法回复。请更新 CCW_COOKIE / CCW_COOKIE_BOT。');
+    process.exit(1);
   }
 
   /* 清脏数据模式：CCW_DELETE_IDS 传了 id 就只删不回复，删完直接退出。
