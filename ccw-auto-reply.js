@@ -55,6 +55,12 @@ const CYCLES = Number(process.env.CCW_CYCLES || '2');
 const GAP_SEC = Number(process.env.CCW_CYCLE_GAP_SEC || '150');
 const STATE_FILE = process.env.CCW_STATE_FILE || './state.json';
 
+/* 同一个人冷却：一分钟内最多回一条，防一个人连发被逐条回复刷屏 */
+const SENDER_COOLDOWN_SEC = Number(process.env.CCW_SENDER_COOLDOWN_SEC || '60');
+
+/* 刷屏阈值：同一人把同一句话刷到 3 条以上，保留最早一条照常回，其余直接删掉 */
+const SPAM_DUP_LIMIT = Number(process.env.CCW_SPAM_DUP_LIMIT || '3');
+
 /* 昵称黑名单：实测「AI助手」这类账号，你一回它它又发一条新通知回来，
  * 会形成回声循环，一轮一条无限往下滚。这类账号一律不回。
  * 用 CCW_IGNORE_NICKNAMES 可以把别的官方号 / 机器人也加进来（逗号分隔）。 */
@@ -291,13 +297,41 @@ async function oneCycle(clients, state, opts) {
   }
   console.log(`[第 ${round} 轮] 合计 ${bucket.length} 条 | 模式: ${dryRun ? 'dry-run' : '真实发送'}`);
 
+  /* 刷屏分组：同一个人 + 同一句话（去掉空白、统一大小写）算一组。
+   * 一组刷到 3 条以上，说明这人在灌水：最早那条正常回，后面重复的全删掉、不回。 */
+  const textKey = (n) => String(n.comment || '').replace(/[^\u4e00-\u9fa5a-z0-9]/gi, '').toLowerCase();
+  const spamGroups = {};
+  for (const n of bucket) {
+    const k = String(n.senderOid || 'anon') + '|' + textKey(n);
+    (spamGroups[k] = spamGroups[k] || []).push(n);
+  }
+  for (const k of Object.keys(spamGroups)) {
+    const g = spamGroups[k];
+    if (g.length >= SPAM_DUP_LIMIT) {
+      g.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      g.forEach((n, i) => { if (i > 0) n._spamDup = true; });
+      console.log(`   检测到刷屏：${g[0].senderName || g[0].senderOid} 重复「${textKey(g[0]).slice(0, 20)}」${g.length} 次，将删除多余 ${g.length - 1} 条`);
+    }
+  }
+
   const now = Date.now();
   const todo = bucket
     .filter((n) => {
       const id = String(n.triggeredById || '');
       if (state.replied[id]) return false;
+      if (n._spamDup) return false;   // 刷屏重复条：不回，交给下面的清理段删
       // 黑名单：AI助手这类账号自问自答式回复会形成回声循环
       const nick = String(n.senderName || '');
+      // 同一人冷却：一分钟内最多回一条。刚回过他就先跳过，留到下一轮再处理
+      const oid = String(n.senderOid || '');
+      if (oid) {
+        state.senderTimes = state.senderTimes || {};
+        const last = Number(state.senderTimes[oid] || 0);
+        if (last && now - last < SENDER_COOLDOWN_SEC * 1000) {
+          console.log(`   跳过 ${nick || oid}（距上次回复 ${Math.round((now - last) / 1000)}s，冷却 ${SENDER_COOLDOWN_SEC}s）`);
+          return false;
+        }
+      }
       // 自我过滤：本账号自己发出的评论若出现在通知里，绝不能回自己，否则会无限自问自答
       if (n.senderOid && ACTOR_OID && String(n.senderOid) === ACTOR_OID) {
         console.log(`   跳过 ${nick || n.senderOid}（本账号自己发的，避免自问自答）`);
@@ -320,6 +354,21 @@ async function oneCycle(clients, state, opts) {
     })
     .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))   // 先回旧的
     .slice(0, MAX_PER_RUN);
+
+  // 先把刷屏的重复条清掉（要板主权限），再处理正常留言
+  const spamWaste = bucket.filter((x) => x._spamDup);
+  for (const n of spamWaste) {
+    const bc = n._board === 'bot' ? clients.bot : clients.owner;
+    try {
+      const d = await bc.del(n.triggeredById);
+      const ok = String(d && d.code) === '200';
+      console.log(`   删刷屏 ${n.triggeredById}（${n.senderName || n.senderOid}）-> ${ok ? '成功' : JSON.stringify(d).slice(0, 120)}`);
+      state.replied[String(n.triggeredById)] = { at: now, spamDeleted: Number(n.triggeredById), delOk: ok };
+    } catch (e) {
+      console.log(`   删刷屏 ${n.triggeredById} 出错: ${e.message}`);
+    }
+    await sleep(rand(2000, 4000));
+  }
 
   console.log(`[第 ${round} 轮] 待回复 ${todo.length} 条（上限 ${MAX_PER_RUN}）`);
   if (!todo.length) return 0;
@@ -398,6 +447,11 @@ async function oneCycle(clients, state, opts) {
         ...(likeOid ? { likedOid: likeOid } : {}),
         ...(act.pin ? { pinned: true } : {})
       };
+      // 记下这个人的最后回复时间，一分钟内不再回他
+      if (n.senderOid) {
+        state.senderTimes = state.senderTimes || {};
+        state.senderTimes[String(n.senderOid)] = Date.now();
+      }
       sent += 1;
       console.log(`   已回复 ${who} -> commentId ${created}${parent ? ' parentId=' + parent : ''}` +
         (asBot ? '（蔚小喵身份）' : ''));
