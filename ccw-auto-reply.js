@@ -392,14 +392,10 @@ async function oneCycle(clients, state, opts) {
   /* 第二份 Cookie：蔚小喵新号。它既用来发回复（两个留言板都用它的身份），
    * 也用来读它自己那边的通知。没配就退回「谁的通知谁回」。 */
   const botClient = BOT_COOKIE ? new CCWClient({ cookie: BOT_COOKIE }) : null;
-  const clients = { owner: client, bot: botClient || client };
+  const clients = { owner: client, bot: client };
 
   try {
     await client.init();
-    if (BOT_COOKIE) {
-      await botClient.init();
-      console.log('第二份 Cookie（蔚小喵账号）签名就绪，回复将以它的身份发出');
-    }
   } catch (e) {
     console.error('签名初始化失败:', e.message);
     console.error('最常见原因：Cookie 里的 token 失效了（登录态过期）。' +
@@ -408,6 +404,24 @@ async function oneCycle(clients, state, opts) {
     process.exit(1);
   }
   console.log('签名就绪');
+
+  /* 第二份 Cookie（蔚小喵账号）：只在它真的能读通知时才启用。
+   * 两个坑：
+   *   1. init() 只取签名密钥，health/check 无论有没有登录都返回正常，签名成功 ≠ session 活着；
+   *   2. 它一旦抛错，绝不能把主号一起带崩（最初版本就是这么写的，第二份 Cookie 一失效整轮全挂）。
+   * 所以这里单独 try，并且额外做一次真正需要身份的读通知，失败就退化成单账号。 */
+  if (BOT_COOKIE) {
+    try {
+      await botClient.init();
+      const probe = await botClient.listReplies({ page: 1, perPage: 1 });
+      if (!Array.isArray(probe)) throw new Error('读通知返回非数组');
+      clients.bot = botClient;
+      console.log('第二份 Cookie（蔚小喵账号）可用，回复将以它的身份发出');
+    } catch (e) {
+      console.log('::warning::第二份 Cookie 不可用（' + String(e.message).slice(0, 90) +
+        '），本次退化成单账号：只用 ' + '主号' + ' 读通知并回复。');
+    }
+  }
 
   /* 清脏数据模式：CCW_DELETE_IDS 传了 id 就只删不回复，删完直接退出。
    * 用来清掉历史遗留的「退回顶层的独立留言」和自己给自己发的测试留言。 */
