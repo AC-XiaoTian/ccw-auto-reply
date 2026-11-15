@@ -1,19 +1,18 @@
 name: CCW 自动回复
 
-# ─── 节奏（2026-11-15 第三版）───
-# 实测两件事：
-#   1. GitHub 对 5 分钟级 cron 大量降频，最小粒度就是 5 分钟，"每 3 分钟"的 schedule 无效；
-#      两次 schedule 实测能隔到 20~40 分钟。所以检测频率只能靠运行内部连轮。
-#   2. 一次跑 15 轮 × 120 秒 ≈ 40 分钟，会把 concurrency 组占满，后面 cron 叫醒的运行
-#      只能排队、并被更新的运行挤掉取消。结果是「跑完一波，然后干等很久」。
-# 现在改成：单次 4 轮 × 120 秒 ≈ 8 分钟，timeout 15 分钟。
-#       运行结束后下一波 cron 立刻接上，两波之间空窗缩到分钟级，
-#       检测间隔实际落在 3 分钟出头，且不会再有 40 分钟的长占用。
+# ─── 节奏（2026-11-15 第四版）───
+# 实测三件事：
+#   1. GitHub 免费 cron 极不可靠：设了每 5 分钟，实测两次 schedule 之间能隔 25~45 分钟。
+#   2. 靠 cron 做“每 3 分钟检测”做不到，所以单次运行内部连轮，轮间隔 120 秒。
+#   3. 运行本身只要 8 分钟，跑完到下一次 cron 之间的空窗才是漏回复的主因。
+# 所以现在加一条「接力」：每次跑完用自己的 token 再派发一次 workflow_dispatch，
+#   下一波立即接上，不需要等 cron。cron 只当保险丝（接力断了、token 失效时。它会兜一下）。
+# 接力链里每波 4 轮 × 120 秒 ≈ 8 分钟，两波首尾相接，检测间隔稳定在 3 分钟出头。
 # 每轮最多回 3 条；没有新留言就空转，不发东西。
 
 on:
   schedule:
-    # 每 5 分钟（GitHub 实际会延迟，这里只当"叫醒"用）
+    # 保险丝：接力断了也能自己爬起来（实际会被 GitHub 降频，不能当主力）
     - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
   workflow_dispatch:
     inputs:
@@ -26,7 +25,6 @@ on:
         type: string
         default: ""
 
-# 需要把 state.json 提交回仓库；失效提醒要能开 Issue
 permissions:
   contents: write
   issues: write
@@ -88,8 +86,7 @@ jobs:
           # 清脏数据：填了 id 就只删不回复
           CCW_DELETE_IDS: ${{ github.event.inputs.delete_ids }}
           # 单次 4 轮：一轮回满 3 条要 70~90 秒（AI 调用之间还隔着 21 秒限流），
-          # 120 秒间隔下真实检测点落在 3 分钟出头。轮数从 15 降到 4，
-          # 让一波跑完就放掉并发组，下一波 cron 立刻接上，避免 40 分钟长占用把队列堵死。
+          # 120 秒间隔下真实检测点落在 3 分钟出头。
           CCW_CYCLES: "4"
           CCW_CYCLE_GAP_SEC: "120"
           # 首次运行只认领历史通知、不发送：state.json 是空的，脚本不知道你手动回过哪些，
@@ -131,6 +128,32 @@ jobs:
           done
           echo "::error::state.json 三次提交均失败，下一轮可能重复回复，请人工检查"
           exit 1
+
+      # 接力：跑完自己派发下一次，把 cron 那 25~45 分钟的空窗吃掉。
+      # 只在 Cookie 正常、且不是清脏数据/演示模式时接力；否则静默跳过、等 cron 兜底。
+      - name: 接力触发下一波
+        if: always() && steps.guard.outputs.ready == 'true' && !github.event.inputs.delete_ids && (github.event_name == 'schedule' || github.event.inputs.dry_run == 'false')
+        env:
+          DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "::warning::未配置 GH_DISPATCH_TOKEN，无法接力，回退为 cron 触发（间隔会很长）。"
+            exit 0
+          fi
+          # 先存一份令牌，避免下面 curl 失败时命令报错退出
+          set +e
+          code=$(curl -s -o /tmp/d.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"ref":"main","inputs":{"dry_run":"false"}}' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/ccw-reply.yml/dispatches")
+          if [ "$code" = "204" ]; then
+            echo "接力成功，下一波已派发"
+          else
+            echo "::warning::接力派发失败（HTTP $code），回退为 cron 触发：以下为服务端返回"
+            head -c 300 /tmp/d.json
+            echo
+          fi
 
       # Cookie 失效时自动开 Issue。没有这一步，失效就是「一声不响地停掉」，
       # 因为鉴权失败被限流成 24 小时才报红一次，很容易错过。
