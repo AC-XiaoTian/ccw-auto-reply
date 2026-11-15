@@ -10,8 +10,16 @@
  *   -> 校验返回体 parentId；留言板若退化成顶层新留言就立刻删掉
  *   -> 记录状态
  *
+ * 双账号（2026-11-15 新增）：
+ *   CCW_COOKIE      板主账号（AC小天）。用它读「AC小天留言板/作品」的通知，
+ *                   也用它的身份删评论、点赞、置顶（这些操作要板主权限）。
+ *   CCW_COOKIE_BOT  发言账号（蔚小喵新号）。回复一律用它的身份发出，
+ *                   所以它能同时回「AC小天留言板」和「自己的留言板」。
+ *                   不填就退回单账号：谁的通知谁回。
+ *
  * 环境变量：
  *   CCW_COOKIE         必填，"token=...; cookie-user-id=..."
+ *   CCW_COOKIE_BOT     可选，第二份 Cookie。填了就用它发所有回复
  *   CCW_AUTO_REPLY     '1' 才真发；否则 dry-run 只打印
  *   CCW_IGNORE_NICKNAMES  逗号分隔的昵称黑名单，这些账号发来的通知一律不回，默认 AI助手
  *   CCW_DELETE_IDS     逗号分隔的评论 id，只做删除、不回复（清脏数据用）
@@ -32,6 +40,9 @@ const fs = require('node:fs');
 const { CCWClient } = require('./ccw-node-client');
 
 const COOKIE = (process.env.CCW_COOKIE || '').trim();
+/* 第二份 Cookie：蔚小喵自己的账号。回复用它发，删除/点赞/置顶用板主账号。
+ * 空着就退回单账号行为。 */
+const BOT_COOKIE = (process.env.CCW_COOKIE_BOT || '').trim();
 const AUTO = process.env.CCW_AUTO_REPLY === '1';
 const MAX_AGE_HOURS = Number(process.env.CCW_MAX_AGE_HOURS || '24');
 const MAX_PER_RUN = Number(process.env.CCW_MAX_PER_RUN || '3');
@@ -233,16 +244,40 @@ function pickText(notice, aiText) {
 
 /* ---------------- 主流程 ---------------- */
 
-async function oneCycle(client, state, opts) {
+async function oneCycle(clients, state, opts) {
   const { round, dryRun } = opts;
-  const list = await client.listReplies({ page: 1, perPage: 20 });
-  console.log(`[第 ${round} 轮] 通知 ${list.length} 条 | 模式: ${dryRun ? 'dry-run' : '真实发送'}`);
+
+  /* 板主账号列：AC小天 一份；蔚小喵 新号另起一份（同一份 Cookie 就不重复拉）。 */
+  const boards = [{ key: 'owner', label: 'AC小天', client: clients.owner }];
+  if (clients.bot && clients.bot !== clients.owner) {
+    boards.push({ key: 'bot', label: '蔚小喵自己的账号', client: clients.bot });
+  }
+
+  const bucket = [];
+  const seen = new Set();
+  for (const b of boards) {
+    let list = [];
+    try {
+      list = await b.client.listReplies({ page: 1, perPage: 20 });
+    } catch (e) {
+      // 单份 Cookie 挂了不拖垮另一份：各自报各自的
+      console.log(`[第 ${round} 轮] ${b.label} 拉通知失败：${e.message}`);
+      continue;
+    }
+    console.log(`[第 ${round} 轮] ${b.label} 通知 ${list.length} 条`);
+    for (const n of list) {
+      const id = String(n.triggeredById || '');
+      if (!id || seen.has(id)) continue;   // 两份通知里可能出现同一条，只处理一次
+      seen.add(id);
+      bucket.push(Object.assign({}, n, { _board: b.key }));
+    }
+  }
+  console.log(`[第 ${round} 轮] 合计 ${bucket.length} 条 | 模式: ${dryRun ? 'dry-run' : '真实发送'}`);
 
   const now = Date.now();
-  const todo = list
+  const todo = bucket
     .filter((n) => {
       const id = String(n.triggeredById || '');
-      if (!id) return false;
       if (state.replied[id]) return false;
       // 黑名单：AI助手这类账号自问自答式回复会形成回声循环
       const nick = String(n.senderName || '');
@@ -264,6 +299,12 @@ async function oneCycle(client, state, opts) {
   for (const n of todo) {
     const who = n.senderName || n.senderOid || '?';
     const preview = String(n.comment || '').replace(/\s+/g, ' ').slice(0, 40);
+    // 板主账号：删评论 / 点赞 / 置顶 都要板主权限，用通知来源那份 Cookie
+    const boardClient = n._board === 'bot' ? clients.bot : clients.owner;
+    // 发言账号：所有回复都用蔚小喵身份发出，这样它能出现在两个人的留言板下
+    const actorClient = clients.bot || clients.owner;
+    const asBot = actorClient !== boardClient;
+
     const act = await aiDecision(n);
     const body = pickText(n, act.reply);
     // AI 漏填 like_oid 时，从正文里刨链接兜底：对方把作品链接贴过来求赞的情况很常见
@@ -274,15 +315,16 @@ async function oneCycle(client, state, opts) {
       if (act.del) tags.push('删评论');
       if (act.pin) tags.push('置顶/点赞该评论');
       if (likeOid) tags.push('给作品 ' + likeOid + ' 点赞');
-      console.log(`   [dry-run] ${who}：「${preview}」-> 「${body}」${tags.length ? ' [动作: ' + tags.join(' + ') + ']' : ''}`);
+      const via = asBot ? '（以蔚小喵身份发出）' : '';
+      console.log(`   [dry-run] ${who}：「${preview}」-> 「${body}」${via}${tags.length ? ' [动作: ' + tags.join(' + ') + ']' : ''}`);
       continue;
     }
 
     /* 1) 辱骂/广告：直接删掉对方那条评论，不回复。
-     *    comment id 就是通知里的 triggeredById。删别人的评论需要作品作者身份，
-     *    失败也照实记录，不做重试。 */
+     *    comment id 就是通知里的 triggeredById。删别人的评论需要板主身份，
+     *    所以这里必须用 boardClient 而不是发言账号。失败也照实记录，不做重试。 */
     if (act.del) {
-      const d = await client.del(n.triggeredById);
+      const d = await boardClient.del(n.triggeredById);
       const ok = String(d && d.code) === '200';
       console.log(`   删评论 ${n.triggeredById}（${who}）-> ${ok ? '成功' : JSON.stringify(d).slice(0, 160)}`);
       state.replied[String(n.triggeredById)] = { at: now, deleted: Number(n.triggeredById), delOk: ok };
@@ -292,7 +334,7 @@ async function oneCycle(client, state, opts) {
 
     /* 2) 对方贴了作品链接求赞：先点作品赞，再回复（顺序按用户要求） */
     if (likeOid) {
-      const r = await client.likeCreation(likeOid);
+      const r = await boardClient.likeCreation(likeOid);
       const ok = String(r && r.code) === '200';
       console.log(`   作品点赞 ${likeOid} -> ${ok ? '成功' : JSON.stringify(r).slice(0, 160)}`);
       await sleep(rand(2000, 4000));
@@ -302,33 +344,35 @@ async function oneCycle(client, state, opts) {
      *    置顶实测是官方权限（自己作品下也报「作品仅允许作者操作」），
      *    所以置顶必然失败，只记一行日志，不当成错误，也不重试。 */
     if (act.pin) {
-      const lr = await client.likeComment(n.triggeredById);
+      const lr = await boardClient.likeComment(n.triggeredById);
       console.log(`   评论点赞 ${n.triggeredById} -> ${String(lr && lr.code) === '200' ? '成功' : JSON.stringify(lr).slice(0, 120)}`);
-      const pr = await client.pinComment(n.triggeredById);
+      const pr = await boardClient.pinComment(n.triggeredById);
       const pinOk = String(pr && pr.code) === '200';
       console.log(`   置顶尝试 ${n.triggeredById} -> ${pinOk ? '成功' : '被拒（' + String((pr && pr.msg) || '').slice(0, 40) + '）'}`);
       await sleep(rand(2000, 4000));
     }
 
-    const r = await client.replyToNotice(n, body);
+    const r = await actorClient.replyToNotice(n, body);
     if (r && String(r.code) === '200') {
       const created = (r.body && r.body.id) || null;
       const parent = (r.body && r.body.parentId) || null;
       // 留言板：如果服务端没把它挂到原留言下（parentId 为空），就是在板上多发了一条独立留言，
-      // 用户看不到"回复"。这种情况立刻删掉这条，并且这次不再重试，避免反复制造脏数据。
+      // 用户看不到"回复"。这种情况立刻删掉这条（用发出它的那个账号删），并且这次不再重试。
       if (n.subjectType === 'PROFILE' && !parent) {
-        console.log(`   留言板未支持嵌套（parentId 为空），已删除退回顶层的 id=${created}`);
-        if (created) await client.del(created);
-        state.replied[String(n.triggeredById)] = { at: now, nested: false, deleted: created };
+        console.log(`   留言板未支持嵌套（parentId 为空），已删除退回顶层的 id=${created}` +
+          (asBot ? '（注意：这条是蔚小喵账号发的，可能是跨账号嵌套不被支持）' : ''));
+        if (created) await actorClient.del(created);
+        state.replied[String(n.triggeredById)] = { at: now, nested: false, deleted: created, viaBot: asBot };
         continue;
       }
       state.replied[String(n.triggeredById)] = {
-        at: now, id: created, parentId: parent,
+        at: now, id: created, parentId: parent, board: n._board, viaBot: asBot,
         ...(likeOid ? { likedOid: likeOid } : {}),
         ...(act.pin ? { pinned: true } : {})
       };
       sent += 1;
-      console.log(`   已回复 ${who} -> commentId ${created}${parent ? ' parentId=' + parent : ''}`);
+      console.log(`   已回复 ${who} -> commentId ${created}${parent ? ' parentId=' + parent : ''}` +
+        (asBot ? '（蔚小喵身份）' : ''));
     } else {
       console.log(`   失败 ${who}: ${JSON.stringify(r).slice(0, 200)}`);
     }
@@ -345,9 +389,17 @@ async function oneCycle(client, state, opts) {
   }
 
   const client = new CCWClient({ cookie: COOKIE });
+  /* 第二份 Cookie：蔚小喵新号。它既用来发回复（两个留言板都用它的身份），
+   * 也用来读它自己那边的通知。没配就退回「谁的通知谁回」。 */
+  const botClient = BOT_COOKIE ? new CCWClient({ cookie: BOT_COOKIE }) : null;
+  const clients = { owner: client, bot: botClient || client };
 
   try {
     await client.init();
+    if (BOT_COOKIE) {
+      await botClient.init();
+      console.log('第二份 Cookie（蔚小喵账号）签名就绪，回复将以它的身份发出');
+    }
   } catch (e) {
     console.error('签名初始化失败:', e.message);
     console.error('最常见原因：Cookie 里的 token 失效了（登录态过期）。' +
@@ -362,12 +414,18 @@ async function oneCycle(client, state, opts) {
   if (DELETE_IDS.length) {
     console.log(`删除模式：${DELETE_IDS.join(', ')}`);
     for (const id of DELETE_IDS) {
-      try {
-        const r = await client.del(id);
-        console.log(`   delete ${id} -> ${JSON.stringify(r).slice(0, 120)}`);
-      } catch (e) {
-        console.log(`   delete ${id} 失败: ${e.message}`);
+      let last = null;
+      /* 不知道这条是哪个账号发的，两个都试一次 */
+      for (const c of [client, BOT_COOKIE ? botClient : null].filter(Boolean)) {
+        try {
+          const r = await c.del(id);
+          last = r;
+          if (String(r && r.code) === '200') break;
+        } catch (e) {
+          last = { msg: e.message };
+        }
       }
+      console.log(`   delete ${id} -> ${JSON.stringify(last).slice(0, 120)}`);
       await sleep(2000);
     }
     process.exit(0);
@@ -381,17 +439,21 @@ async function oneCycle(client, state, opts) {
    * dry-run 不走这里，这样你手动预览仍能看到将要回的内容。
    * state 非空后这段永远不触发。 */
   if (BOOTSTRAP && !dryRun && Object.keys(state.replied).length === 0) {
-    const list = await client.listReplies({ page: 1, perPage: 20 });
     const nowBoot = Date.now();
     let claimed = 0;
-    for (const item of list) {
-      const id = String(item.triggeredById || '');
-      if (!id) continue;
-      if ((nowBoot - (item.createdAt || 0)) / 3600000 > MAX_AGE_HOURS) continue;
-      state.replied[id] = { at: nowBoot, bootstrap: true };
-      claimed += 1;
-      const preview = String(item.comment || '').replace(/\s+/g, ' ').slice(0, 30);
-      console.log(`   [认领] ${item.senderName || item.senderOid || '?'}：「${preview}」`);
+    /* 两份 Cookie 的通知都要认领，否则第二份账号的历史留言会被当成新留言回一遍 */
+    for (const c of [client, BOT_COOKIE ? botClient : null].filter(Boolean)) {
+      const list = await c.listReplies({ page: 1, perPage: 20 });
+      for (const item of list) {
+        const id = String(item.triggeredById || '');
+        if (!id) continue;
+        if (state.replied[id]) continue;
+        if ((nowBoot - (item.createdAt || 0)) / 3600000 > MAX_AGE_HOURS) continue;
+        state.replied[id] = { at: nowBoot, bootstrap: true };
+        claimed += 1;
+        const preview = String(item.comment || '').replace(/\s+/g, ' ').slice(0, 30);
+        console.log(`   [认领] ${item.senderName || item.senderOid || '?'}：「${preview}」`);
+      }
     }
     saveState(state);
     console.log(`首次运行：已认领 ${claimed} 条历史通知，本轮不发送。下一轮起只回新留言。`);
@@ -402,7 +464,7 @@ async function oneCycle(client, state, opts) {
   let fatal = '';
   for (let i = 1; i <= CYCLES; i++) {
     try {
-      total += await oneCycle(client, state, { round: i, dryRun });
+      total += await oneCycle(clients, state, { round: i, dryRun });
     } catch (e) {
       console.error(`第 ${i} 轮出错:`, e.message);
       // 鉴权类错误不能吞掉，否则 Actions 显示成功、失败提示也不会触发
