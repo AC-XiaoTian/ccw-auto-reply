@@ -394,6 +394,16 @@ async function oneCycle(clients, state, opts) {
   const botClient = BOT_COOKIE ? new CCWClient({ cookie: BOT_COOKIE }) : null;
   const clients = { owner: client, bot: client };
 
+  /* 身份输出：Cookie 里的 cookie-user-id 就是账号 oid（和 CCW 页面 URL 里那个一致）。
+   * 出问题时不用猜「到底哪份 Cookie 是哪个号」，一眼能看出来。
+   * 注意：只打 oid，不打 token。 */
+  const oidOf = (ck) => {
+    const m = /cookie-user-id=([0-9a-zA-Z]+)/.exec(ck || '');
+    return m ? m[1] : '(Cookie 里没有 cookie-user-id)';
+  };
+  console.log('CCW_COOKIE     身份 oid=' + oidOf(COOKIE));
+  if (BOT_COOKIE) console.log('CCW_COOKIE_BOT 身份 oid=' + oidOf(BOT_COOKIE));
+
   try {
     await client.init();
   } catch (e) {
@@ -416,10 +426,23 @@ async function oneCycle(clients, state, opts) {
       const probe = await botClient.listReplies({ page: 1, perPage: 1 });
       if (!Array.isArray(probe)) throw new Error('读通知返回非数组');
       clients.bot = botClient;
-      console.log('第二份 Cookie（蔚小喵账号）可用，回复将以它的身份发出');
+      console.log('第二份 Cookie（CCW_COOKIE_BOT）可用，回复将以它的身份发出');
     } catch (e) {
       console.log('::warning::第二份 Cookie 不可用（' + String(e.message).slice(0, 90) +
-        '），本次退化成单账号：只用 ' + '主号' + ' 读通知并回复。');
+        '），本次退化成单账号，只用 CCW_COOKIE 那个账号读通知并回复。');
+    }
+  }
+
+  /* 主号 Cookie 也顺手验一次活：401 不会在 init() 阶段暴露，只有带身份的接口才会。
+   * 这里失败不退出——下一轮 oneCycle 会按「拉通知失败」记日志；但如果两份都挂，
+   * 那就是真的没法干活，得让本次运行报红，避免密码失效后静默空转。 */
+  try {
+    await client.listReplies({ page: 1, perPage: 1 });
+  } catch (e) {
+    console.log('::warning::主号 Cookie 读通知失败：' + String(e.message).slice(0, 90));
+    if (clients.bot === client) {
+      console.error('两份 Cookie 都不可用，本次无法回复。请更新 CCW_COOKIE / CCW_COOKIE_BOT。');
+      process.exit(1);
     }
   }
 
