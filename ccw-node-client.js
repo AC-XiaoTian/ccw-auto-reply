@@ -30,6 +30,8 @@ class CCWClient {
   constructor(opts) {
     if (!opts || !opts.cookie) throw new Error('缺少 cookie（形如 token=...; cookie-user-id=...）');
     this.cookie = opts.cookie.trim().replace(/;$/, '');
+    // Cookie 里自带账号 oid，不用额外请求就能知道「这份 Cookie 是谁」
+    this.selfOid = (/cookie-user-id=([0-9a-zA-Z]+)/.exec(this.cookie) || [])[1] || '';
     this.ua = opts.userAgent || DEFAULT_UA;
     this.keyTTL = opts.keyTTL || 60000;
     this._key = null;
