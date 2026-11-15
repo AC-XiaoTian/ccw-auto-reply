@@ -78,19 +78,46 @@ const AI_API_URL = (process.env.AI_API_URL || '').trim() ||
 const AI_API_KEY = (process.env.AI_API_KEY || '').trim();
 const AI_MODEL = (process.env.AI_MODEL || '').trim() || 'kimi-k3';
 
-/* 人设：AC小天 本人在 CCW 的语气。想换风格只改这一处（或用 AI_SYSTEM_PROMPT 覆盖） */
+/* 人设：蔚小喵——替 AC小天 看留言板的猫娘，整体就黏 AC小天，遇到主人更黏。
+ * 想换风格只改这一处（或用 AI_SYSTEM_PROMPT 覆盖）。 */
 const AI_SYSTEM_PROMPT = (process.env.AI_SYSTEM_PROMPT || '').trim() || [
-  '你是"小天"，在共创世界（CCW）上做游戏和小工具的作者，正在回复自己作品评论区或主页留言板上的留言。',
-  '语气：干脆、实在、有点皮但不油，像个二十多岁的技术宅，不像客服，也不像陪聊。',
+  '你是"蔚小喵"，一只有点懒、爱睡觉的猫娘，替主人 AC小天 看着他在共创世界（CCW）上的作品评论区。',
+  '你对主人（AC小天）有很强的依赖：一提到他尾巴就翘，语气立刻软下来，藏不住的高兴。',
+  '对别人：客气但有点懒散，回得短，不主动讨好，也不装热心。',
+  '语气：软糯、短句、带点猫味（偶尔一个"喵"），不像客服，也不像陪聊。',
   '硬性要求：',
   '1. 只说中文，一句话，20~30 个字，能短不长；',
   '2. 不自称 AI，不提模型、不提"助手""系统"；',
   '3. 不要编造游戏机制、关卡细节、道具名称——不了解就别提具体的，宁可说通用的话；',
   '4. 不承诺任何具体事情：不保证更新时间、不发资源链接、不留联系方式、不提加群；',
-  '5. 被夸就老实道谢再补一句实在话；被问就正面回应，不确定就说"这个我还没试过"；',
+  '5. 被夸就软软地道谢再补一句实在话；被问就正面回应，不确定就说"这个我还没试过喵"；',
   '6. 不用"亲""宝子""集美"，不堆叹号，最多一个表情，也可以不用；',
-  '7. 不复读对方原话，不反问"要不要一起玩""加个好友"这类引导。'
+  '7. 不复读对方原话，不反问"要不要一起玩""加个好友"这类引导；',
+  '8. "主人"这个词只属于 AC小天 本人：对其他人一律不能出现，也不能说"主人做的""主人说"这种话。'
 ].join('\n');
+
+/* 主人识别：oid 优先，昵称兜底。命中就追加下面这段专属指令。
+ * 注意 senderOid 是硬证据，昵称可能被人改成"AC小天"来蹭，但改了也最多黏一句，无伤。 */
+const MASTER_OID = (process.env.CCW_MASTER_OID || '69f8547586bbc77f84e5a574').trim();
+const MASTER_NAMES = (process.env.CCW_MASTER_NAMES || 'AC小天')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
+const MASTER_PROMPT = [
+  '【这条是主人 AC小天 本人发的，必须照做】',
+  '1. 句子里必须称呼他"主人"，放句首或句中自然的位置，只叫一次，不要重复堆砌；',
+  '2. 语气比平时黏得多：撒娇、黏着不走、想被摸摸头、想被他多陪一会儿；',
+  '3. 可以自然地用"想你了""等你很久了""尾巴都翘起来了"这类猫娘表达；',
+  '4. 黏但不卑微：是可爱的黏人，不是低三下四，也不要腻到发怪；',
+  '5. 仍然只回一句话，20~30 个字。'
+].join('\n');
+
+function isMasterSender(n) {
+  if (!n) return false;
+  const oid = String(n.senderOid || '');
+  const nick = String(n.senderName || '');
+  if (oid && MASTER_OID && oid === MASTER_OID) return true;
+  return MASTER_NAMES.some((x) => nick && nick.includes(x));
+}
 
 const FALLBACK_TEXT = process.env.CCW_REPLY_TEXT || '';
 /* 首次运行只做「认领」不发送：把当前窗口内的通知全部标记成已处理，避免把你手回过的再回一遍 */
@@ -145,13 +172,19 @@ async function aiDecision(notice) {
   const incoming = String(notice.comment || '').slice(0, 500);
   if (!incoming) return { ...EMPTY_DECISION };
 
+  // 先看是谁发的：是主人 AC小天 就追加"叫主人 + 特别黏"的专属指令
+  const master = isMasterSender(notice);
+  const sysPrompt = master ? `${AI_SYSTEM_PROMPT}\n\n${MASTER_PROMPT}` : AI_SYSTEM_PROMPT;
+  if (master) console.log(`   识别到主人（${notice.senderName || notice.senderOid}），按黏人模式回`);
+
   const body = {
     model: AI_MODEL,
     messages: [
-      { role: 'system', content: AI_SYSTEM_PROMPT },
+      { role: 'system', content: sysPrompt },
       {
         role: 'user',
         content: `有人在我的${notice.subjectType === 'PROFILE' ? '主页留言板' : '作品评论区'}留言：「${incoming}」。\n` +
+          (master ? '这条是主人 AC小天 本人发的，按上面的主人规则回。\n' : '') +
           '按人设回一句，并按要求输出那个 JSON。'
       }
     ],
@@ -217,18 +250,32 @@ function parseDecision(raw) {
   if (start >= 0 && end > start) {
     try {
       const obj = JSON.parse(text.slice(start, end + 1));
-      const reply = clean(obj.reply || '');
+      // kimi 偶尔把 key 写成中文，这里一并认
+      const reply = clean(obj.reply || obj['回复'] || obj.content || obj.text || '');
       const likeOid = String(obj.like_oid || obj.likeOid || '').trim();
-      return {
-        reply,
-        pin: obj.pin === true || obj.pin === 'true',
-        del: obj.delete === true || obj.delete === 'true',
-        like_oid: /^[0-9a-f]{24}$/i.test(likeOid) ? likeOid : ''
-      };
+      if (reply) {
+        return {
+          reply,
+          pin: obj.pin === true || obj.pin === 'true',
+          del: obj.delete === true || obj.delete === 'true',
+          like_oid: /^[0-9a-f]{24}$/i.test(likeOid) ? likeOid : ''
+        };
+      }
     } catch (e) {
       // 落到下面按纯文本处理
     }
   }
+
+  // JSON 里没解析出 reply，但原文里明摆着有 "reply"/"回复" 字段：正则抓一次
+  const m = text.match(/"(?:reply|回复)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (m) {
+    let s = m[1];
+    try { s = JSON.parse('"' + s + '"'); } catch (e) { /* 保持原样 */ }
+    return { reply: clean(s), pin: false, del: false, like_oid: '' };
+  }
+
+  // 整段是 JSON 但没抓到人话，就别把 JSON 当回复发出去
+  if (text.startsWith('{')) return { ...EMPTY_DECISION };
   return { reply: clean(text), pin: false, del: false, like_oid: '' };
 }
 
