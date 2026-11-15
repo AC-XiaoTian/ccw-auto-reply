@@ -68,7 +68,11 @@ jobs:
       - name: 执行自动回复
         if: steps.guard.outputs.ready == 'true'
         env:
+          # 板主账号（AC小天）：读它的通知，也用它的身份删评论/点赞/置顶
           CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
+          # 发言账号（蔚小喵新号）：所有回复都用它的身份发出。
+          # 不填就退回单账号：谁的通知谁回。填了就会出现“蔚小喵回 AC小天 的留言板”。
+          CCW_COOKIE_BOT: ${{ secrets.CCW_COOKIE_BOT }}
           # 定时任务真发；手动触发默认 dry-run，除非把勾去掉
           CCW_AUTO_REPLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && '0' || '1' }}
 
@@ -79,7 +83,7 @@ jobs:
           AI_SYSTEM_PROMPT: ${{ vars.AI_SYSTEM_PROMPT }}
 
           CCW_MAX_AGE_HOURS: "24"
-          # 每轮最多回 3 条
+          # 每轮最多回 3 条（两个账号的通知合计）
           CCW_MAX_PER_RUN: "3"
           # 「AI助手」这类账号你一回它就再发一条新通知，会形成回声循环，一律不回
           CCW_IGNORE_NICKNAMES: "AI助手"
