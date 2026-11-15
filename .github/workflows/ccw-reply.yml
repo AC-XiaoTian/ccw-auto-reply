@@ -1,14 +1,14 @@
 name: CCW 自动回复
 
-# ─── 节奏（2026-11-15 第四版）───
+# ─── 节奏（2026-11-15 第五版）───
 # 实测三件事：
 #   1. GitHub 免费 cron 极不可靠：设了每 5 分钟，实测两次 schedule 之间能隔 25~45 分钟。
 #   2. 靠 cron 做“每 3 分钟检测”做不到，所以单次运行内部连轮，轮间隔 120 秒。
-#   3. 运行本身只要 8 分钟，跑完到下一次 cron 之间的空窗才是漏回复的主因。
-# 所以现在加一条「接力」：每次跑完用自己的 token 再派发一次 workflow_dispatch，
-#   下一波立即接上，不需要等 cron。cron 只当保险丝（接力断了、token 失效时。它会兜一下）。
-# 接力链里每波 4 轮 × 120 秒 ≈ 8 分钟，两波首尾相接，检测间隔稳定在 3 分钟出头。
-# 每轮最多回 3 条；没有新留言就空转，不发东西。
+#   3. 运行本身要 8~13 分钟，跑完到下一次 cron 之间的空窗才是漏回复的主因。
+# 所以现在加了一条「接力」：每次跑完用自己的 token 再派发一次 workflow_dispatch，
+#   下一波立即接上，不需要等 cron。cron 只当保险丝（接力断了、token 失效时它兜一下）。
+# 接力派发前先查队列：已经有别的运行在等就不派，避免 cron 和接力双重触发把队列堆起来
+#   每个运行 8~13 分钟，积两条后面就会越来越晚。
 
 on:
   schedule:
@@ -66,6 +66,7 @@ jobs:
           fi
 
       - name: 执行自动回复
+        id: run
         if: steps.guard.outputs.ready == 'true'
         env:
           # 板主账号（AC小天）：读它的通知，也用它的身份删评论/点赞/置顶
@@ -109,8 +110,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 本轮状态先存一份出来。一轮要跑十几分钟，期间远端可能已经被别的 commit 改过，
-          # 直接 push 会冲突（之前就是这样失败三次、状态没落盘、下一轮重复回复）。
+          # 本轮状态先存一份出来。一轮要跑十几分钟，期间远端可能已经被别的 commit 改过。
           cp state.json "$RUNNER_TEMP/state-local.json"
           for i in 1 2 3; do
             git fetch origin main
@@ -144,13 +144,22 @@ jobs:
             echo "::warning::未配置 GH_DISPATCH_TOKEN，无法接力，回退为 cron 触发（间隔会很长）。"
             exit 0
           fi
-          # 先存一份令牌，避免下面 curl 失败时命令报错退出
           set +e
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/ccw-reply.yml"
+          # 先查队列：除了自己，还有没有在等或正在跑的。
+          # 有就不再派——每个运行 8~13 分钟，积两条后面就会越推越晚。
+          busy=$(curl -s -H "Authorization: Bearer $DISPATCH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$api/runs?per_page=20" \
+            | jq --argjson rid "$GITHUB_RUN_ID" '[.workflow_runs[] | select(.id != $rid) | select(.status=="queued" or .status=="pending" or .status=="in_progress" or .status=="waiting")] | length')
+          if [ "${busy:-0}" -gt 0 ]; then
+            echo "队列里已有 ${busy} 条运行在等或正在跑，本次不派发，避免积压"
+            exit 0
+          fi
           code=$(curl -s -o /tmp/d.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $DISPATCH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -d '{"ref":"main","inputs":{"dry_run":"false"}}' \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/ccw-reply.yml/dispatches")
+            "$api/dispatches")
           if [ "$code" = "204" ]; then
             echo "接力成功，下一波已派发"
           else
