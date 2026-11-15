@@ -304,6 +304,12 @@ async function oneCycle(clients, state, opts) {
         state.replied[id] = { at: now, self: true };
         return false;
       }
+      // 内置机器人过滤：昵称含 BOT 的基本都是自动回复号，机器对刷会无限来回发消息
+      if (/bot/i.test(nick)) {
+        console.log(`   跳过 ${nick}（疑似自动回复机器人，避免机器对刷）`);
+        state.replied[id] = { at: now, bot: nick };
+        return false;
+      }
       if (IGNORE_NICKNAMES.some((x) => nick.includes(x))) {
         console.log(`   跳过 ${nick}（在黑名单里，避免回声循环）`);
         state.replied[id] = { at: now, ignored: nick };
