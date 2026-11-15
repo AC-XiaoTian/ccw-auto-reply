@@ -1,51 +1,51 @@
-/* 探针 v9：
- * 1) 通知里到底有没有「怎么给你充电」那条（判断二级回复会不会发通知）
- * 2) 试其它 notifyGroup 取值，看有没有专门的「回复我」分组
+/* 探针 v10：找「按留言板拉评论列表」的读接口。
+ * 目的：让蔚小喵用自己的 Cookie 读 AC小天 留言板（oid 6a2804...）上的评论，
+ *      不依赖 AC小天 的通知，也不需要 AC小天 的 token。
  */
 'use strict';
 
 const { CCWClient } = require('./ccw-node-client');
 
+const OWNER = '6a2804f986bbc77f84e60cdf';   // AC小天 留言板
 const show = (label, r) => {
   let s; try { s = JSON.stringify(r); } catch { s = String(r); }
-  console.log(label + ' => ' + (s || '').slice(0, 200));
+  console.log(label + ' => ' + (s || '').slice(0, 300));
 };
 
 (async () => {
-  const c = new CCWClient({ cookie: process.env.CCW_COOKIE || '' });
+  const cookie = (process.env.CCW_COOKIE_BOT || '').trim() || (process.env.CCW_COOKIE || '').trim();
+  const c = new CCWClient({ cookie });
+  const oid = (/cookie-user-id=([0-9a-zA-Z]+)/.exec(cookie) || [])[1] || '?';
+  console.log('使用 Cookie 身份 oid=' + oid);
   await c.init();
+  console.log('签名就绪');
 
-  // 1) 当前 COMMENT_TO_ME 全量（两条页都拉，避免漏）
-  const all = [];
-  for (const page of [1, 2]) {
-    const r = await c._signed('/notification/page?page=' + page + '&perPage=20',
-      { notifyGroup: 'COMMENT_TO_ME', page, perPage: 20 }, { retry: true });
-    const arr = (r.body && (r.body.data || r.body.list)) || [];
-    all.push(...arr);
-  }
-  console.log('COMMENT_TO_ME 共 ' + all.length + ' 条');
-  const hit = all.filter((n) => String(n.comment || '').includes('充电'));
-  console.log('含「充电」的条数: ' + hit.length);
-  for (const n of hit) {
-    console.log('  命中 commentId=' + n.triggeredById + ' 类型=' + n.subjectType + ' by=' + n.senderName +
-      ' 时间=' + new Date(n.createdAt || 0).toISOString().slice(11, 16) + 'Z');
-  }
-  // 顺带把最新 5 条的时间打出来，看通知延迟
-  for (const n of all.slice(0, 5)) {
-    console.log('  最新 commentId=' + n.triggeredById + ' by=' + n.senderName +
-      ' 「' + String(n.comment || '').replace(/\s+/g, ' ').slice(0, 24) + '」 ' +
-      new Date(n.createdAt || 0).toISOString().slice(11, 16) + 'Z');
+  // 0) 先确认这份 Cookie 读自己的通知能通（对照组）
+  try {
+    const l = await c.listReplies({ page: 1, perPage: 3 });
+    console.log('对照：读自己通知 -> ' + l.length + ' 条');
+  } catch (e) {
+    console.log('对照：读自己通知失败 -> ' + e.message.slice(0, 80));
   }
 
-  // 2) 其它分组
-  for (const g of ['REPLY_TO_ME', 'REPLY_COMMENT_TO_ME', 'SUB_COMMENT_TO_ME', 'MENTION_TO_ME', 'ALL']) {
-    const r = await c._signed('/notification/page?page=1&perPage=20',
-      { notifyGroup: g, page: 1, perPage: 20 }, { retry: true });
-    const arr = (r.body && (r.body.data || r.body.list)) || [];
-    console.log('分组 ' + g + ' -> ' + arr.length + ' 条 ' + (arr.length ? '' : String(r.msg || '').slice(0, 40)));
-    const h = arr.filter((n) => String(n.comment || '').includes('充电'));
-    if (h.length) console.log('   !! 该分组里有「充电」: commentId=' + h[0].triggeredById);
+  const q = '?page=1&perPage=20';
+  const tries = [
+    ['A /comment/reply?page {topic}', `/comment/reply${q}`, { topic: { subjectOid: OWNER, subjectType: 'PROFILE' }, page: 1, perPage: 20 }],
+    ['B /comment/reply?page {subjectOid}', `/comment/reply${q}`, { subjectOid: OWNER, subjectType: 'PROFILE', page: 1, perPage: 20 }],
+    ['C /comment/reply {topicOid}', '/comment/reply', { topicOid: OWNER, topicType: 'PROFILE', page: 1, perPage: 20 }],
+    ['D /comment/reply {oid,type}', '/comment/reply', { oid: OWNER, type: 'PROFILE', page: 1, perPage: 20 }],
+    ['E /comment/page {topic}', `/comment/page${q}`, { topic: { subjectOid: OWNER, subjectType: 'PROFILE' }, page: 1, perPage: 20 }],
+    ['F /comment {topic}', '/comment', { topic: { subjectOid: OWNER, subjectType: 'PROFILE' }, page: 1, perPage: 20 }]
+  ];
+
+  for (const [label, path, body] of tries) {
+    try {
+      const r = await c._signed(path, body, { retry: false });
+      show(label, r);
+    } catch (e) {
+      console.log(label + ' => 抛错: ' + e.message.slice(0, 120));
+    }
   }
 
-  console.log('v9 结束');
+  console.log('v10 结束');
 })().catch((e) => { console.error('探测出错:', e.message); process.exit(1); });
