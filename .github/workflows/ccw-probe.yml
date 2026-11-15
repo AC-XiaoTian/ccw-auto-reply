@@ -20,5 +20,7 @@ jobs:
           node-version: "20"
       - name: 执行探针
         env:
+          # 优先用第二份（蔚小喵）；它失效时退回主号
+          CCW_COOKIE_BOT: ${{ secrets.CCW_COOKIE_BOT }}
           CCW_COOKIE: ${{ secrets.CCW_COOKIE }}
         run: node probe-actions.js
