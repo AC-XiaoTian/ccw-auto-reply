@@ -298,6 +298,12 @@ async function oneCycle(clients, state, opts) {
       if (state.replied[id]) return false;
       // 黑名单：AI助手这类账号自问自答式回复会形成回声循环
       const nick = String(n.senderName || '');
+      // 自我过滤：本账号自己发出的评论若出现在通知里，绝不能回自己，否则会无限自问自答
+      if (n.senderOid && ACTOR_OID && String(n.senderOid) === ACTOR_OID) {
+        console.log(`   跳过 ${nick || n.senderOid}（本账号自己发的，避免自问自答）`);
+        state.replied[id] = { at: now, self: true };
+        return false;
+      }
       if (IGNORE_NICKNAMES.some((x) => nick.includes(x))) {
         console.log(`   跳过 ${nick}（在黑名单里，避免回声循环）`);
         state.replied[id] = { at: now, ignored: nick };
