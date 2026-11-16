@@ -979,6 +979,31 @@
    "parentId": 10304629,
    "board": "owner",
    "viaBot": false
+  },
+  "10304632": {
+   "at": 1794862640979,
+   "deleted": 10304632,
+   "delOk": true
+  },
+  "10304633": {
+   "at": 1794862640979,
+   "spamDeleted": 10304633,
+   "delOk": true
+  },
+  "10304634": {
+   "at": 1794862640979,
+   "spamDeleted": 10304634,
+   "delOk": true
+  },
+  "10304635": {
+   "at": 1794862640979,
+   "spamDeleted": 10304635,
+   "delOk": true
+  },
+  "10304636": {
+   "at": 1794862640979,
+   "spamDeleted": 10304636,
+   "delOk": true
   }
  }
 }
