@@ -172,6 +172,13 @@ const AUTH_FAIL_THROTTLE_HOURS = Number(process.env.CCW_AUTH_FAIL_THROTTLE_HOURS
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
+/* v3 通知的 createdAt 是 ISO 字符串（旧接口是毫秒数字），统一转毫秒，否则时间比较全是 NaN */
+function toMs(v) {
+  if (typeof v === 'number' && isFinite(v)) return v;
+  const t = Date.parse(String(v == null ? '' : v));
+  return isNaN(t) ? 0 : t;
+}
+
 /* AI 调用节流：保证任意两次调用间隔 >= AI_MIN_INTERVAL_MS */
 let _lastAiAt = 0;
 async function aiPace() {
@@ -370,7 +377,13 @@ async function oneCycle(clients, state, opts) {
   for (const b of boards) {
     let list = [];
     try {
-      list = await b.client.listReplies({ page: 1, perPage: 20 });
+      let cursor = null;
+      for (let i = 0; i < 2; i++) {
+        const pg = await b.client.listReplies({ group: 'REPLY', cursor });
+        list = list.concat(pg.items);
+        if (!pg.hasMore || !pg.nextCursor) break;
+        cursor = pg.nextCursor;
+      }
     } catch (e) {
       // 单份 Cookie 挂了不拖垮另一份：各自报各自的
       console.log(`[第 ${round} 轮] ${b.label} 拉通知失败：${e.message}`);
@@ -397,7 +410,7 @@ async function oneCycle(clients, state, opts) {
   for (const k of Object.keys(spamGroups)) {
     const g = spamGroups[k];
     if (g.length >= SPAM_DUP_LIMIT) {
-      g.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      g.sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt));
       g.forEach((n, i) => { if (i > 0) n._spamDup = true; });
       console.log(`   检测到刷屏：${g[0].senderName || g[0].senderOid} 重复「${textKey(g[0]).slice(0, 20)}」${g.length} 次，将删除多余 ${g.length - 1} 条`);
     }
@@ -438,10 +451,15 @@ async function oneCycle(clients, state, opts) {
         state.replied[id] = { at: now, ignored: nick };
         return false;
       }
-      const age = (now - (n.createdAt || 0)) / 3600000;
+      /* 没有正文的通知（点赞/收藏类）不要回一句"谢谢留言" */
+      if (!String(n.comment || '').replace(/[^\u4e00-\u9fa5a-z0-9]/gi, '').trim()) {
+        state.replied[id] = { at: now, empty: true };
+        return false;
+      }
+      const age = (now - toMs(n.createdAt)) / 3600000;
       return age <= MAX_AGE_HOURS;
     })
-    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))   // 先回旧的
+    .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))   // 先回旧的
     .slice(0, MAX_PER_RUN);
 
   // 先把刷屏的重复条清掉（要板主权限），再处理正常留言
@@ -592,9 +610,9 @@ async function oneCycle(clients, state, opts) {
   const alive = new Map();
   const checkAlive = async (label, c) => {
     try {
-      const probe = await c.listReplies({ page: 1, perPage: 1 });
-      alive.set(c, Array.isArray(probe));
-      if (!Array.isArray(probe)) throw new Error('读通知返回非数组');
+      const probe = await c.listReplies({ group: 'REPLY' });
+      alive.set(c, Array.isArray(probe.items));
+      if (!Array.isArray(probe.items)) throw new Error('读通知未返回 items 数组');
       return true;
     } catch (e) {
       alive.set(c, false);
@@ -670,12 +688,12 @@ async function oneCycle(clients, state, opts) {
     let claimed = 0;
     /* 两份 Cookie 的通知都要认领，否则第二份账号的历史留言会被当成新留言回一遍 */
     for (const c of [client, BOT_COOKIE ? botClient : null].filter(Boolean)) {
-      const list = await c.listReplies({ page: 1, perPage: 20 });
+      const { items: list } = await c.listReplies({ group: 'REPLY' });
       for (const item of list) {
         const id = String(item.triggeredById || '');
         if (!id) continue;
         if (state.replied[id]) continue;
-        if ((nowBoot - (item.createdAt || 0)) / 3600000 > MAX_AGE_HOURS) continue;
+        if ((nowBoot - toMs(item.createdAt)) / 3600000 > MAX_AGE_HOURS) continue;
         state.replied[id] = { at: nowBoot, bootstrap: true };
         claimed += 1;
         const preview = String(item.comment || '').replace(/\s+/g, ' ').slice(0, 30);
