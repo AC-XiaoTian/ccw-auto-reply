@@ -102,15 +102,19 @@ class CCWClient {
 
   /* ---------- 业务 API ---------- */
 
-  /* 读“回复我的”通知，返回 data 数组。每条的 triggeredById 就是可回复的评论 id */
-  async listReplies({ page = 1, perPage = 20 } = {}) {
-    const r = await this._signed(
-      '/notification/page?page=' + page + '&perPage=' + perPage,
-      { notifyGroup: 'COMMENT_TO_ME', page, perPage },
-      { retry: true }
-    );
-    if (r.code !== '200') throw new Error('拉通知失败：' + JSON.stringify(r).slice(0, 300));
-    return (r.body && (r.body.data || r.body.list)) || [];
+  /* 读“回复我的”通知（新版消息中心 v3）。
+   * 旧 /notification/page 已下线（10828904 消息中心已升级）。
+   * v3 第一页 body 只传 {group}，翻页传 {group, cursor}；cursor 与 readToken 同传会报参数无效。 */
+  async listReplies({ group = 'REPLY', cursor = null } = {}) {
+    const body = cursor ? { group, cursor } : { group };
+    const r = await this._signed('/notification/v3/page', body, { retry: true });
+    if (!r || r.code !== '200') throw new Error('拉通知失败：' + JSON.stringify(r).slice(0, 300));
+    const b = r.body || {};
+    return {
+      items: Array.isArray(b.items) ? b.items : [],
+      nextCursor: b.nextCursor || null,
+      hasMore: !!b.hasMore
+    };
   }
 
   /* 发顶层评论 */
